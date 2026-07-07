@@ -113,6 +113,7 @@ public class MessageCenterController : ControllerBase
     public async Task<IActionResult> GetMyMessages(
         [FromQuery] int page = 1,
         [FromQuery] int limit = 100,
+        [FromQuery] bool? read = null,
         CancellationToken ct = default)
     {
         if (page < 1)
@@ -131,21 +132,23 @@ public class MessageCenterController : ControllerBase
             return Unauthorized(new { error = "preferred_username claim is missing from token." });
         }
 
-        var novuPage = page - 1;
-        var feed = await _novu.GetFeedAsync(novuPage, limit, subscriberId, ct);
-        var messages = feed.Data.Select(message => new
+        List<NovuMessageItem> sourceMessages;
+        if (read.HasValue)
         {
-            messageId = message.Id,
-            sourceSystem = message.Payload?.SourceSystem,
-            businessType = message.Payload?.BusinessType,
-            businessId = message.Payload?.BusinessId,
-            title = message.Subject,
-            content = message.Content,
-            url = message.Cta?.Data?.Url,
-            read = message.Read,
-            seen = message.Seen,
-            createdAt = message.CreatedAt
-        }).ToList();
+            sourceMessages = (await GetAllFeedMessagesAsync(subscriberId, ct))
+                .Where(message => message.Read == read.Value)
+                .Skip((page - 1) * limit)
+                .Take(limit)
+                .ToList();
+        }
+        else
+        {
+            var novuPage = page - 1;
+            var feed = await _novu.GetFeedAsync(novuPage, limit, subscriberId, ct);
+            sourceMessages = feed.Data;
+        }
+
+        var messages = MapMessages(sourceMessages);
 
         return Ok(messages);
     }
@@ -172,6 +175,35 @@ public class MessageCenterController : ControllerBase
     [HttpPost("messages/{messageId}/unread")]
     public async Task<IActionResult> MarkUnread(string messageId, CancellationToken ct)
         => await MarkAs(messageId, read: false, ct);
+
+    [HttpPost("my/read-all")]
+    public async Task<IActionResult> MarkAllMyMessagesRead(CancellationToken ct)
+    {
+        var subscriberId = GetPreferredUsername();
+        if (subscriberId is null)
+        {
+            return Unauthorized(new { error = "preferred_username claim is missing from token." });
+        }
+
+        var messages = await GetAllFeedMessagesAsync(subscriberId, ct);
+        var unreadMessages = messages
+            .Where(message => !message.Read && !string.IsNullOrWhiteSpace(message.Id))
+            .ToList();
+
+        foreach (var message in unreadMessages)
+        {
+            await _novu.MarkAsAsync(subscriberId, message.Id!, read: true, ct);
+        }
+
+        var refreshedMessages = await GetAllFeedMessagesAsync(subscriberId, ct);
+        var unreadCount = refreshedMessages.Count(message => !message.Read);
+
+        return Ok(new
+        {
+            markedCount = unreadMessages.Count,
+            unreadCount
+        });
+    }
 
     private async Task<IActionResult> MarkAs(string messageId, bool read, CancellationToken ct)
     {
@@ -219,4 +251,19 @@ public class MessageCenterController : ControllerBase
             page++;
         }
     }
+
+    private static List<object> MapMessages(IEnumerable<NovuMessageItem> messages)
+        => messages.Select(message => new
+        {
+            messageId = message.Id,
+            sourceSystem = message.Payload?.SourceSystem,
+            businessType = message.Payload?.BusinessType,
+            businessId = message.Payload?.BusinessId,
+            title = message.Subject,
+            content = message.Content,
+            url = message.Cta?.Data?.Url,
+            read = message.Read,
+            seen = message.Seen,
+            createdAt = message.CreatedAt
+        }).Cast<object>().ToList();
 }

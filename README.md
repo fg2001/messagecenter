@@ -103,7 +103,7 @@ TOKEN=$(curl -s -X POST \
   | jq -r .access_token)
 ```
 
-获取测试用户 JWT。该 Token 的 `preferred_username` 为 `196045`，用于查询自己的消息、未读数、标记已读/未读：
+获取测试用户 JWT。该 Token 的 `preferred_username` 为 `196045`，用于查询自己的消息、未读数、标记已读/未读、一键已读：
 
 ```bash
 TOKEN=$(curl -s -X POST \
@@ -158,12 +158,20 @@ MVP 阶段仅支持 `receivers[].type == "user"` 的接收者，其他类型会�
 
 ### 我的消息
 
-`GET /api/message-center/my?page=1&limit=100`
+`GET /api/message-center/my?page=1&limit=100&read=false`
 
 `page` 对外按业务习惯从 `1` 开始计数；API 内部会转换为 Novu 的 `0` 起始页码。
 
+`read` 为可选过滤条件：
+
+- 不传：查询全部消息。
+- `read=false`：只查询未读消息。
+- `read=true`：只查询已读消息。
+
+当传入 `read` 过滤条件时，API 会先分页拉取当前用户全部消息，再按 `read` 状态过滤并对过滤后的结果做业务分页，避免只过滤 Novu 当前页导致漏掉后续页消息。
+
 ```bash
-curl "http://localhost:5000/api/message-center/my?page=1&limit=10" \
+curl "http://localhost:5000/api/message-center/my?page=1&limit=10&read=false" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -242,6 +250,28 @@ curl -X POST http://localhost:5000/api/message-center/messages/6a27771843f156a3e
   "unreadCount": 4
 }
 ```
+
+### 一键已读
+
+`POST /api/message-center/my/read-all`
+
+将当前登录用户的所有未读消息标记为已读。
+
+```bash
+curl -X POST http://localhost:5000/api/message-center/my/read-all \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**响应 `200`**：
+
+```json
+{
+  "markedCount": 29,
+  "unreadCount": 0
+}
+```
+
+`markedCount` 表示本次实际提交给 Novu 标记已读的未读消息数量；`unreadCount` 为标记后重新回查得到的未读数量。
 
 ## 错误处理
 
@@ -335,6 +365,12 @@ curl -s -X POST "$BASE/api/message-center/send" \
 curl -s "$BASE/api/message-center/my?page=1&limit=10" \
   -H "Authorization: Bearer $TOKEN"
 
+curl -s "$BASE/api/message-center/my?page=1&limit=10&read=false" \
+  -H "Authorization: Bearer $TOKEN"
+
 curl -s "$BASE/api/message-center/unread-count" \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -s -X POST "$BASE/api/message-center/my/read-all" \
   -H "Authorization: Bearer $TOKEN"
 ```
