@@ -2,10 +2,12 @@ using MessageCenter.Api.Audit;
 using MessageCenter.Api.HttpClients;
 using MessageCenter.Api.Middleware;
 using MessageCenter.Api.Options;
+using MessageCenter.Api.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using System.Net.Http.Headers;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -16,6 +18,8 @@ builder.Services.Configure<SourceSystemOptions>(options =>
 {
     builder.Configuration.GetSection(SourceSystemOptions.Section).Bind(options.Names);
 });
+builder.Services.Configure<RedisOptions>(
+    builder.Configuration.GetSection(RedisOptions.Section));
 builder.Services.AddHttpClient<NovuClient>((sp, client) =>
 {
     var novuOptions = sp.GetRequiredService<IOptions<NovuOptions>>().Value;
@@ -27,6 +31,14 @@ builder.Services.AddHttpClient<NovuClient>((sp, client) =>
 });
 // Polly extension point: add .AddPolicyHandler(...) to the NovuClient IHttpClientBuilder when retries are introduced.
 builder.Services.AddSingleton<IAuditSink, LoggerAuditSink>();
+builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
+{
+    var options = sp.GetRequiredService<IOptions<RedisOptions>>().Value;
+    return ConnectionMultiplexer.Connect(options.ConnectionString);
+});
+builder.Services.AddSingleton<MessageProjectionStore>();
+builder.Services.AddSingleton<MessageWorkQueue>();
+builder.Services.AddHostedService<MessageBackgroundWorker>();
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
@@ -63,6 +75,12 @@ var sourceSystemOptions = app.Services.GetRequiredService<IOptions<SourceSystemO
 if (sourceSystemOptions.Names.Count == 0)
 {
     throw new InvalidOperationException("SourceSystemNames is empty. At least one client mapping is required.");
+}
+
+var redis = app.Services.GetRequiredService<IOptions<RedisOptions>>().Value;
+if (string.IsNullOrWhiteSpace(redis.ConnectionString))
+{
+    throw new InvalidOperationException("Redis:ConnectionString is required.");
 }
 
 app.UseMiddleware<NovuExceptionMiddleware>();

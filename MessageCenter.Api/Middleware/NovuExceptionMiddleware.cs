@@ -47,6 +47,12 @@ public class NovuExceptionMiddleware
                 error = "Novu request timed out."
             });
         }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            _logger.LogDebug(
+                "MessageCenter request was canceled by the client. Path={Path}",
+                context.Request.Path);
+        }
     }
 
     private static async Task WriteJson(HttpContext context, int statusCode, object body)

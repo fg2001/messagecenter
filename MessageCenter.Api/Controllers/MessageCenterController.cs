@@ -1,7 +1,6 @@
 using System.Security.Claims;
 using MessageCenter.Api.Audit;
 using MessageCenter.Api.HttpClients;
-using MessageCenter.Api.HttpClients.Dtos;
 using MessageCenter.Api.Models;
 using MessageCenter.Api.Options;
 using MessageCenter.Api.Services;
@@ -14,25 +13,32 @@ namespace MessageCenter.Api.Controllers;
 [ApiController]
 [Route("api/message-center")]
 [Authorize]
-public class MessageCenterController : ControllerBase
+public sealed class MessageCenterController : ControllerBase
 {
-    private const int FeedPageSize = 100;
+    private static readonly HashSet<string> MessageViews =
+        new(StringComparer.OrdinalIgnoreCase) { "all", "unread", "read" };
 
     private readonly NovuClient _novu;
     private readonly NovuOptions _options;
     private readonly SourceSystemOptions _sourceSystemOptions;
     private readonly IAuditSink _audit;
+    private readonly MessageProjectionStore _projection;
+    private readonly MessageWorkQueue _jobs;
 
     public MessageCenterController(
         NovuClient novu,
         IOptions<NovuOptions> options,
         IOptions<SourceSystemOptions> sourceSystemOptions,
-        IAuditSink audit)
+        IAuditSink audit,
+        MessageProjectionStore projection,
+        MessageWorkQueue jobs)
     {
         _novu = novu;
         _options = options.Value;
         _sourceSystemOptions = sourceSystemOptions.Value;
         _audit = audit;
+        _projection = projection;
+        _jobs = jobs;
     }
 
     [HttpPost("send")]
@@ -50,14 +56,13 @@ public class MessageCenterController : ControllerBase
         {
             return StatusCode(StatusCodes.Status403Forbidden, new
             {
-                error = $"Client '{clientId}' is not registered in SourceSystemNames. Contact the platform team to register this client before sending messages.",
+                error = $"Client '{clientId}' is not registered in SourceSystemNames.",
                 clientId
             });
         }
 
         request.SourceSystem = sourceSystem;
         var triggers = MessageMapper.Map(request, _options.DefaultWorkflowId, out var skipped);
-
         if (triggers.Count == 0)
         {
             return BadRequest(new
@@ -84,6 +89,8 @@ public class MessageCenterController : ControllerBase
             transactionId = result.TransactionId;
             status = result.Status;
             acknowledged = result.Acknowledged;
+            await _projection.RegisterActiveAsync(trigger.SubscriberId);
+            await _jobs.EnqueueSyncAsync(trigger.SubscriberId);
 
             _audit.Record(new AuditEntry(
                 result.TransactionId,
@@ -97,33 +104,33 @@ public class MessageCenterController : ControllerBase
                 DateTime.UtcNow));
         }
 
-        var response = new SendMessageResponse
+        return StatusCode(StatusCodes.Status201Created, new SendMessageResponse
         {
             TransactionId = transactionId,
             Status = status,
             Acknowledged = acknowledged,
             Accepted = accepted,
             Skipped = skipped
-        };
-
-        return StatusCode(StatusCodes.Status201Created, response);
+        });
     }
 
     [HttpGet("my")]
     public async Task<IActionResult> GetMyMessages(
+        [FromQuery] string view = "all",
         [FromQuery] int page = 1,
-        [FromQuery] int limit = 100,
-        [FromQuery] bool? read = null,
-        CancellationToken ct = default)
+        [FromQuery] int limit = 100)
     {
+        if (!MessageViews.Contains(view))
+        {
+            return BadRequest(new { error = "view must be one of: all, unread, read." });
+        }
         if (page < 1)
         {
             return BadRequest(new { error = "page must be greater than or equal to 1." });
         }
-
-        if (limit < 1)
+        if (limit is < 1 or > 100)
         {
-            return BadRequest(new { error = "limit must be greater than or equal to 1." });
+            return BadRequest(new { error = "limit must be between 1 and 100." });
         }
 
         var subscriberId = GetPreferredUsername();
@@ -132,29 +139,26 @@ public class MessageCenterController : ControllerBase
             return Unauthorized(new { error = "preferred_username claim is missing from token." });
         }
 
-        List<NovuMessageItem> sourceMessages;
-        if (read.HasValue)
-        {
-            sourceMessages = (await GetAllFeedMessagesAsync(subscriberId, ct))
-                .Where(message => message.Read == read.Value)
-                .Skip((page - 1) * limit)
-                .Take(limit)
-                .ToList();
-        }
-        else
-        {
-            var novuPage = page - 1;
-            var feed = await _novu.GetFeedAsync(novuPage, limit, subscriberId, ct);
-            sourceMessages = feed.Data;
-        }
+        await _projection.RegisterActiveAsync(subscriberId);
+        var result = await _projection.GetPageAsync(
+            subscriberId,
+            view.ToLowerInvariant(),
+            page,
+            limit);
+        if (result is not null) return Ok(result);
 
-        var messages = MapMessages(sourceMessages);
-
-        return Ok(messages);
+        await _jobs.EnqueueRebuildAsync(subscriberId);
+        return Accepted(new MessagePageResponse(
+            "building",
+            Array.Empty<MessageItemResponse>(),
+            page,
+            limit,
+            0,
+            0));
     }
 
-    [HttpGet("unread-count")]
-    public async Task<IActionResult> GetUnreadCount(CancellationToken ct)
+    [HttpGet("summary")]
+    public async Task<IActionResult> GetSummary()
     {
         var subscriberId = GetPreferredUsername();
         if (subscriberId is null)
@@ -162,22 +166,24 @@ public class MessageCenterController : ControllerBase
             return Unauthorized(new { error = "preferred_username claim is missing from token." });
         }
 
-        var messages = await GetAllFeedMessagesAsync(subscriberId, ct);
-        var unreadCount = messages.Count(message => !message.Read);
+        await _projection.RegisterActiveAsync(subscriberId);
+        var result = await _projection.GetSummaryAsync(subscriberId);
+        if (result is not null) return Ok(result);
 
-        return Ok(new { unreadCount });
+        await _jobs.EnqueueRebuildAsync(subscriberId);
+        return Accepted(new MessageSummaryResponse("building", 0, 0));
     }
 
     [HttpPost("messages/{messageId}/read")]
-    public async Task<IActionResult> MarkRead(string messageId, CancellationToken ct)
-        => await MarkAs(messageId, read: true, ct);
+    public Task<IActionResult> MarkRead(string messageId, CancellationToken ct)
+        => MarkAs(messageId, read: true, ct);
 
     [HttpPost("messages/{messageId}/unread")]
-    public async Task<IActionResult> MarkUnread(string messageId, CancellationToken ct)
-        => await MarkAs(messageId, read: false, ct);
+    public Task<IActionResult> MarkUnread(string messageId, CancellationToken ct)
+        => MarkAs(messageId, read: false, ct);
 
     [HttpPost("my/read-all")]
-    public async Task<IActionResult> MarkAllMyMessagesRead(CancellationToken ct)
+    public async Task<IActionResult> MarkAllMyMessagesRead()
     {
         var subscriberId = GetPreferredUsername();
         if (subscriberId is null)
@@ -185,46 +191,49 @@ public class MessageCenterController : ControllerBase
             return Unauthorized(new { error = "preferred_username claim is missing from token." });
         }
 
-        var messages = await GetAllFeedMessagesAsync(subscriberId, ct);
-        var unreadMessages = messages
-            .Where(message => !message.Read && !string.IsNullOrWhiteSpace(message.Id))
-            .ToList();
-
-        foreach (var message in unreadMessages)
+        if (!await _projection.IsReadyAsync(subscriberId))
         {
-            await _novu.MarkAsAsync(subscriberId, message.Id!, read: true, ct);
+            await _jobs.EnqueueRebuildAsync(subscriberId);
+            return Conflict(new { error = "Message projection is building." });
         }
 
-        var refreshedMessages = await GetAllFeedMessagesAsync(subscriberId, ct);
-        var unreadCount = refreshedMessages.Count(message => !message.Read);
-
-        return Ok(new
-        {
-            markedCount = unreadMessages.Count,
-            unreadCount
-        });
+        var job = await _jobs.EnqueueReadAllAsync(subscriberId);
+        return Accepted(job);
     }
 
-    private async Task<IActionResult> MarkAs(string messageId, bool read, CancellationToken ct)
+    [HttpGet("my/read-all/{jobId}")]
+    public async Task<IActionResult> GetReadAllJob(string jobId)
     {
         var subscriberId = GetPreferredUsername();
         if (subscriberId is null)
         {
             return Unauthorized(new { error = "preferred_username claim is missing from token." });
+        }
+
+        var status = await _jobs.GetReadAllStatusAsync(jobId, subscriberId);
+        return status is null ? NotFound() : Ok(status);
+    }
+
+    private async Task<IActionResult> MarkAs(
+        string messageId,
+        bool read,
+        CancellationToken ct)
+    {
+        var subscriberId = GetPreferredUsername();
+        if (subscriberId is null)
+        {
+            return Unauthorized(new { error = "preferred_username claim is missing from token." });
+        }
+
+        if (!await _projection.IsReadyAsync(subscriberId))
+        {
+            await _jobs.EnqueueRebuildAsync(subscriberId);
+            return Conflict(new { error = "Message projection is building." });
         }
 
         await _novu.MarkAsAsync(subscriberId, messageId, read, ct);
-
-        var messages = await GetAllFeedMessagesAsync(subscriberId, ct);
-        var unreadCount = messages.Count(message => !message.Read);
-        var updated = messages.FirstOrDefault(message => message.Id == messageId);
-
-        return Ok(new
-        {
-            messageId,
-            read = updated?.Read ?? read,
-            unreadCount
-        });
+        await _projection.SetReadStateAsync(subscriberId, messageId, read);
+        return Ok(new MessageStateResponse(messageId, read));
     }
 
     private string? GetPreferredUsername()
@@ -232,38 +241,4 @@ public class MessageCenterController : ControllerBase
         var username = User.FindFirstValue("preferred_username");
         return string.IsNullOrWhiteSpace(username) ? null : username;
     }
-
-    private async Task<List<NovuMessageItem>> GetAllFeedMessagesAsync(string subscriberId, CancellationToken ct)
-    {
-        var page = 0;
-        var messages = new List<NovuMessageItem>();
-
-        while (true)
-        {
-            var feed = await _novu.GetFeedAsync(page, FeedPageSize, subscriberId, ct);
-            messages.AddRange(feed.Data);
-
-            if (!feed.HasMore || feed.Data.Count == 0)
-            {
-                return messages;
-            }
-
-            page++;
-        }
-    }
-
-    private static List<object> MapMessages(IEnumerable<NovuMessageItem> messages)
-        => messages.Select(message => new
-        {
-            messageId = message.Id,
-            sourceSystem = message.Payload?.SourceSystem,
-            businessType = message.Payload?.BusinessType,
-            businessId = message.Payload?.BusinessId,
-            title = message.Subject,
-            content = message.Content,
-            url = message.Cta?.Data?.Url,
-            read = message.Read,
-            seen = message.Seen,
-            createdAt = message.CreatedAt
-        }).Cast<object>().ToList();
 }
