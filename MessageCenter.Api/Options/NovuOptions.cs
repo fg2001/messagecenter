@@ -9,4 +9,5 @@ public class NovuOptions
     public string DefaultWorkflowId { get; set; } = "system-notification";
     public string InAppChannel { get; set; } = "in_app";
     public int TimeoutSeconds { get; set; } = 10;
+    public int WorkerTimeoutSeconds { get; set; } = 30;
 }

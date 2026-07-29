@@ -41,20 +41,79 @@ public sealed class MessageProjectionStore
     public Task<bool> IsReadyAsync(string subscriberId)
         => _redis.KeyExistsAsync(ReadyKey(subscriberId));
 
-    public async Task BeginRebuildAsync(string subscriberId)
+    public async Task BeginRebuildAsync(string subscriberId, string generation)
     {
         await _redis.KeyDeleteAsync(new RedisKey[]
         {
-            ReadyKey(subscriberId),
-            MessagesKey(subscriberId),
-            AllKey(subscriberId),
-            UnreadKey(subscriberId),
-            ReadKey(subscriberId)
+            RebuildMessagesKey(subscriberId, generation),
+            RebuildAllKey(subscriberId, generation),
+            RebuildUnreadKey(subscriberId, generation),
+            RebuildReadKey(subscriberId, generation)
         });
+        await _redis.StringSetAsync(
+            ActiveRebuildKey(subscriberId),
+            generation,
+            TimeSpan.FromDays(1));
     }
 
-    public Task CompleteRebuildAsync(string subscriberId)
-        => _redis.StringSetAsync(ReadyKey(subscriberId), "ready");
+    public async Task CompleteRebuildAsync(string subscriberId, string generation)
+    {
+        const string script = @"
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+                return 0
+            end
+            for i = 2, 5 do
+                redis.call('DEL', KEYS[i])
+                if redis.call('EXISTS', KEYS[i + 4]) == 1 then
+                    redis.call('RENAME', KEYS[i + 4], KEYS[i])
+                end
+            end
+            redis.call('SET', KEYS[10], 'ready')
+            redis.call('DEL', KEYS[1])
+            return 1";
+        var result = await _redis.ScriptEvaluateAsync(
+            script,
+            new RedisKey[]
+            {
+                ActiveRebuildKey(subscriberId),
+                MessagesKey(subscriberId),
+                AllKey(subscriberId),
+                UnreadKey(subscriberId),
+                ReadKey(subscriberId),
+                RebuildMessagesKey(subscriberId, generation),
+                RebuildAllKey(subscriberId, generation),
+                RebuildUnreadKey(subscriberId, generation),
+                RebuildReadKey(subscriberId, generation),
+                ReadyKey(subscriberId)
+            },
+            new RedisValue[] { generation });
+        if ((long)result == 0)
+        {
+            throw new InvalidOperationException(
+                $"Rebuild generation '{generation}' is no longer active.");
+        }
+    }
+
+    public async Task AbandonRebuildAsync(string subscriberId, string generation)
+    {
+        await _redis.KeyDeleteAsync(new RedisKey[]
+        {
+            RebuildMessagesKey(subscriberId, generation),
+            RebuildAllKey(subscriberId, generation),
+            RebuildUnreadKey(subscriberId, generation),
+            RebuildReadKey(subscriberId, generation)
+        });
+
+        const string script = @"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0";
+        await _redis.ScriptEvaluateAsync(
+            script,
+            new RedisKey[] { ActiveRebuildKey(subscriberId) },
+            new RedisValue[] { generation });
+    }
 
     public async Task<bool> ContainsAnyAsync(
         string subscriberId,
@@ -69,6 +128,30 @@ public sealed class MessageProjectionStore
     }
 
     public async Task UpsertAsync(string subscriberId, IEnumerable<NovuMessageItem> messages)
+        => await UpsertIntoAsync(
+            MessagesKey(subscriberId),
+            AllKey(subscriberId),
+            UnreadKey(subscriberId),
+            ReadKey(subscriberId),
+            messages);
+
+    public async Task UpsertRebuildAsync(
+        string subscriberId,
+        string generation,
+        IEnumerable<NovuMessageItem> messages)
+        => await UpsertIntoAsync(
+            RebuildMessagesKey(subscriberId, generation),
+            RebuildAllKey(subscriberId, generation),
+            RebuildUnreadKey(subscriberId, generation),
+            RebuildReadKey(subscriberId, generation),
+            messages);
+
+    private async Task UpsertIntoAsync(
+        RedisKey messagesKey,
+        RedisKey allKey,
+        RedisKey unreadKey,
+        RedisKey readKey,
+        IEnumerable<NovuMessageItem> messages)
     {
         var batch = _redis.CreateBatch();
         var tasks = new List<Task>();
@@ -83,20 +166,20 @@ public sealed class MessageProjectionStore
             var id = message.Id;
 
             tasks.Add(batch.HashSetAsync(
-                MessagesKey(subscriberId),
+                messagesKey,
                 id,
                 JsonSerializer.Serialize(item, JsonOptions)));
-            tasks.Add(batch.SortedSetAddAsync(AllKey(subscriberId), id, score));
+            tasks.Add(batch.SortedSetAddAsync(allKey, id, score));
 
             if (message.Read)
             {
-                tasks.Add(batch.SortedSetAddAsync(ReadKey(subscriberId), id, score));
-                tasks.Add(batch.SortedSetRemoveAsync(UnreadKey(subscriberId), id));
+                tasks.Add(batch.SortedSetAddAsync(readKey, id, score));
+                tasks.Add(batch.SortedSetRemoveAsync(unreadKey, id));
             }
             else
             {
-                tasks.Add(batch.SortedSetAddAsync(UnreadKey(subscriberId), id, score));
-                tasks.Add(batch.SortedSetRemoveAsync(ReadKey(subscriberId), id));
+                tasks.Add(batch.SortedSetAddAsync(unreadKey, id, score));
+                tasks.Add(batch.SortedSetRemoveAsync(readKey, id));
             }
         }
 
@@ -155,24 +238,52 @@ public sealed class MessageProjectionStore
 
     public async Task SetReadStateAsync(string subscriberId, string messageId, bool read)
     {
-        var score = await _redis.SortedSetScoreAsync(AllKey(subscriberId), messageId);
+        await SetReadStateInKeysAsync(
+            MessagesKey(subscriberId),
+            AllKey(subscriberId),
+            UnreadKey(subscriberId),
+            ReadKey(subscriberId),
+            messageId,
+            read);
+
+        var generation = await _redis.StringGetAsync(ActiveRebuildKey(subscriberId));
+        if (!generation.HasValue) return;
+
+        await SetReadStateInKeysAsync(
+            RebuildMessagesKey(subscriberId, generation!),
+            RebuildAllKey(subscriberId, generation!),
+            RebuildUnreadKey(subscriberId, generation!),
+            RebuildReadKey(subscriberId, generation!),
+            messageId,
+            read);
+    }
+
+    private async Task SetReadStateInKeysAsync(
+        RedisKey messagesKey,
+        RedisKey allKey,
+        RedisKey unreadKey,
+        RedisKey readKey,
+        string messageId,
+        bool read)
+    {
+        var score = await _redis.SortedSetScoreAsync(allKey, messageId);
         if (!score.HasValue) return;
 
-        var addKey = read ? ReadKey(subscriberId) : UnreadKey(subscriberId);
-        var removeKey = read ? UnreadKey(subscriberId) : ReadKey(subscriberId);
+        var addKey = read ? readKey : unreadKey;
+        var removeKey = read ? unreadKey : readKey;
         var transaction = _redis.CreateTransaction();
         _ = transaction.SortedSetAddAsync(addKey, messageId, score.Value);
         _ = transaction.SortedSetRemoveAsync(removeKey, messageId);
         await transaction.ExecuteAsync();
 
-        var value = await _redis.HashGetAsync(MessagesKey(subscriberId), messageId);
+        var value = await _redis.HashGetAsync(messagesKey, messageId);
         if (!value.HasValue) return;
 
         var item = JsonSerializer.Deserialize<MessageItemResponse>(value!, JsonOptions);
         if (item is null) return;
 
         await _redis.HashSetAsync(
-            MessagesKey(subscriberId),
+            messagesKey,
             messageId,
             JsonSerializer.Serialize(new MessageItemResponse
             {
@@ -232,4 +343,14 @@ public sealed class MessageProjectionStore
     private RedisKey AllKey(string subscriberId) => $"{_prefix}:{{{subscriberId}}}:all";
     private RedisKey UnreadKey(string subscriberId) => $"{_prefix}:{{{subscriberId}}}:unread";
     private RedisKey ReadKey(string subscriberId) => $"{_prefix}:{{{subscriberId}}}:read";
+    private RedisKey ActiveRebuildKey(string subscriberId)
+        => $"{_prefix}:{{{subscriberId}}}:rebuild-active";
+    private RedisKey RebuildMessagesKey(string subscriberId, string generation)
+        => $"{_prefix}:{{{subscriberId}}}:rebuild:{generation}:messages";
+    private RedisKey RebuildAllKey(string subscriberId, string generation)
+        => $"{_prefix}:{{{subscriberId}}}:rebuild:{generation}:all";
+    private RedisKey RebuildUnreadKey(string subscriberId, string generation)
+        => $"{_prefix}:{{{subscriberId}}}:rebuild:{generation}:unread";
+    private RedisKey RebuildReadKey(string subscriberId, string generation)
+        => $"{_prefix}:{{{subscriberId}}}:rebuild:{generation}:read";
 }

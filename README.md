@@ -7,29 +7,37 @@ ASP.NET Core 6 API，使用 Novu 保存消息正文和最终读写状态，使�
 | 服务 | 地址 |
 |---|---|
 | MessageCenter API | `http://localhost:5000` |
+| MessageCenter Worker | 独立常驻进程，无对外业务端口 |
 | Novu API | `http://192.168.124.2:13000` |
 | Keycloak | `http://192.168.124.2:18085/realms/master` |
 | Redis | `192.168.124.2:16379`，DB 7 |
 
-API 与后台任务 Worker 在同一个 ASP.NET Core 进程中启动。没有第二个可执行程序或第二个启动入口。
+API 与后台任务 Worker 使用两个独立启动入口。API 只查询投影和写入 Redis Streams；Worker 独立消费、重试和确认任务。生产环境必须同时部署二者。
 
 ```powershell
-dotnet build .\MessageCenter.Api\MessageCenter.Api.csproj
+dotnet build .\MessageCenter.Worker\MessageCenter.Worker.csproj
 dotnet run --project .\MessageCenter.Api\MessageCenter.Api.csproj --urls http://localhost:5000
+dotnet run --project .\MessageCenter.Worker\MessageCenter.Worker.csproj
 ```
 
 健康检查：
 
 ```bash
 curl http://localhost:5000/health
+curl http://localhost:5000/health/worker
 ```
+
+`/health/worker` 在最近 30 秒没有收到独立 Worker 心跳时返回 HTTP 503。
 
 ## 状态与一致性
 
 - Novu 是消息正文及最终已读状态的权威数据源。
-- Redis 保存消息轻量投影、`all/unread/read` 有序索引、后台任务和任务状态。
+- Redis 保存消息轻量投影、`all/unread/read` 有序索引、Streams 任务和任务状态。
 - 查询只访问 Redis，不在 HTTP 请求中遍历 Novu 全部消息。
-- Redis 投影不存在时，查询返回 HTTP 202 和 `state=building`，同进程 Worker 从 Novu 重建投影。
+- Redis 投影不存在时，查询返回 HTTP 202 和 `state=building`，独立 Worker 从 Novu 重建投影。
+- 重建写入任务专属 staging 投影；全部分页成功后原子切换。已有正式投影在重建和重试期间继续可读。
+- Worker 使用 Consumer Group 确认任务；进程退出后的 pending 任务由其他 Worker 回收，不会因出队而丢失。
+- Novu 分页瞬时异常最多重试 3 次，整个任务最多尝试 5 次，并使用指数退避。
 - 新消息只能通过 `POST /send` 进入正式链路；该接口会登记订阅者并触发增量同步。直接绕过 MessageCenter 调用 Novu 不属于受支持的生产契约。
 
 ## 鉴权
@@ -169,7 +177,7 @@ POST /api/message-center/messages/{messageId}/unread
 }
 ```
 
-状态为 `queued`、`running`、`completed` 或 `failed`。Worker 每批处理 100 条，Novu 写并发固定为 8，避免一键已读制造请求风暴。
+状态为 `queued`、`running`、`retrying`、`completed` 或 `failed`。Worker 每批处理 100 条，Novu 写并发固定为 8，避免一键已读制造请求风暴。
 
 ## 前端调用示例
 
@@ -191,8 +199,39 @@ store.unreadCount = page.unreadCount
     "ConnectionString": "192.168.124.2:16379,abortConnect=false,connectTimeout=5000,syncTimeout=5000",
     "Database": 7,
     "KeyPrefix": "message-center"
+  },
+  "Novu": {
+    "TimeoutSeconds": 10,
+    "WorkerTimeoutSeconds": 30
+  },
+  "MessageWorker": {
+    "PageRetryCount": 3,
+    "JobRetryCount": 5,
+    "RetryBaseDelaySeconds": 2,
+    "LockSeconds": 60,
+    "PendingIdleSeconds": 90,
+    "ActiveSyncIntervalSeconds": 30
   }
 }
 ```
 
 Redis 不可用时服务应视为不可用，不回退到逐页扫描 Novu。
+
+## 测试与 Linux 发布
+
+Redis 集成测试使用独立随机前缀，并在结束时删除测试键：
+
+```powershell
+$env:MESSAGE_CENTER_TEST_REDIS = '192.168.124.2:16379,abortConnect=false,connectTimeout=5000,syncTimeout=5000'
+dotnet test .\MessageCenter.Tests\MessageCenter.Tests.csproj
+```
+
+测试覆盖 staging 原子切换、重建期间读状态一致性以及 pending 任务跨 Consumer 回收。
+
+测试服务器没有安装 .NET 运行时时，可发布 Linux 自包含 Worker：
+
+```powershell
+dotnet restore .\MessageCenter.Worker\MessageCenter.Worker.csproj -r linux-x64
+dotnet publish .\MessageCenter.Worker\MessageCenter.Worker.csproj `
+  -c Release -r linux-x64 --self-contained true --no-restore
+```

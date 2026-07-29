@@ -10,12 +10,15 @@ Remove all request-path full-feed scans and make unread count, unread/read filte
 business service -> MessageCenter API -> Novu
 web              -> MessageCenter API -> Redis projection
                                       -> Novu state mutation
-same API process -> background worker -> Redis job queue -> Novu
+MessageCenter API -> Redis Streams -> MessageCenter Worker -> Novu
 ```
 
 - Novu owns message content and final read state.
 - Redis owns a rebuildable query projection and durable work queue.
-- The API and worker share one process and one startup entry.
+- The API and worker use independent startup entries and deployment lifecycles.
+- Redis Streams consumer groups provide acknowledgement and pending-job recovery.
+- Rebuilds use staging keys and atomically replace the live projection only after success.
+- Subscriber locks prevent concurrent rebuild/sync/read-all work across worker replicas.
 - ClickHouse is not used: this workload is high-frequency state mutation and point counting, not append-only analytics.
 
 ## Contracts
@@ -34,3 +37,5 @@ same API process -> background worker -> Redis job queue -> Novu
 3. Read-all HTTP request returns immediately and processing is bounded.
 4. Redis loss can be repaired by background rebuild from Novu.
 5. Backend build, frontend type-check focused delta, live auth, projection build, page query, mark and job flow pass.
+6. A stopped worker leaves the stream entry pending; a replacement worker reclaims and completes it.
+7. Rebuild timeout/retry never deletes the last ready projection.

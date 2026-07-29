@@ -38,7 +38,6 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 });
 builder.Services.AddSingleton<MessageProjectionStore>();
 builder.Services.AddSingleton<MessageWorkQueue>();
-builder.Services.AddHostedService<MessageBackgroundWorker>();
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
@@ -88,6 +87,20 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/health/worker", async (MessageWorkQueue queue) =>
+{
+    var heartbeat = await queue.GetHeartbeatAsync();
+    return heartbeat is null
+        ? Results.Json(
+            new { status = "unavailable" },
+            statusCode: StatusCodes.Status503ServiceUnavailable)
+        : Results.Ok(new
+        {
+            status = "ok",
+            worker = heartbeat.Worker,
+            at = heartbeat.At
+        });
+});
 app.MapControllers();
 
 app.Run();
