@@ -9,6 +9,8 @@ public class NovuTriggerPayload
 
 public class NovuPayloadFields
 {
+    public string RequestId { get; init; } = string.Empty;
+    public string SendId { get; init; } = string.Empty;
     public string SourceSystem { get; init; } = string.Empty;
     public string BusinessType { get; init; } = string.Empty;
     public string? BusinessId { get; init; }

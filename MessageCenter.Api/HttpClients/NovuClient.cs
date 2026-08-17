@@ -21,16 +21,23 @@ public class NovuClient
         string workflowId,
         string subscriberId,
         object payload,
+        string transactionId,
         CancellationToken ct = default)
     {
         var body = new
         {
             name = workflowId,
             to = new { subscriberId },
-            payload
+            payload,
+            transactionId
         };
 
-        var response = await _http.PostAsJsonAsync("/v1/events/trigger", body, JsonOptions, ct);
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/events/trigger")
+        {
+            Content = JsonContent.Create(body, options: JsonOptions)
+        };
+        request.Headers.TryAddWithoutValidation("Idempotency-Key", transactionId);
+        var response = await _http.SendAsync(request, ct);
         response.EnsureSuccessStatusCode();
 
         var envelope = await response.Content.ReadFromJsonAsync<NovuEnvelope<TriggerResult>>(

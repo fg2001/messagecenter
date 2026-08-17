@@ -1,6 +1,6 @@
 # MessageCenter API
 
-ASP.NET Core 6 API，使用 Novu 保存消息正文和最终读写状态，使用 Redis 保存可重建的查询投影与后台任务。Redis 不是第二消息源；投影可以从 Novu 重新构建。
+ASP.NET Core 6 API，使用 DM8 Outbox 可靠接收待发送消息，使用 Novu 保存消息正文和最终读写状态，使用 Redis 保存可重建的查询投影与后台任务。Redis 不是第二消息源；投影可以从 Novu 重新构建。
 
 ## 运行拓扑
 
@@ -11,10 +11,13 @@ ASP.NET Core 6 API，使用 Novu 保存消息正文和最终读写状态，使�
 | Novu API | `http://192.168.124.2:13000` |
 | Keycloak | `http://192.168.124.2:18085/realms/master` |
 | Redis | `192.168.124.2:16379`，DB 7 |
+| DM8 | 通过 `ConnectionStrings__MessageCenter` 注入 |
 
-API 与后台任务 Worker 使用两个独立启动入口。API 只查询投影和写入 Redis Streams；Worker 独立消费、重试和确认任务。生产环境必须同时部署二者。
+API 与后台任务 Worker 使用两个独立启动入口。发送 API 事务性写入 DM8 Outbox，查询 API 读取 Redis 投影；Worker 独立投递 Novu、确认消息可见，并消费 Redis 投影任务。生产环境必须同时部署二者。
 
 ```powershell
+$env:ConnectionStrings__MessageCenter = '<DM8 connection string>'
+$env:Novu__ApiKey = '<Novu API key>'
 dotnet build .\MessageCenter.Worker\MessageCenter.Worker.csproj
 dotnet run --project .\MessageCenter.Api\MessageCenter.Api.csproj --urls http://localhost:5000
 dotnet run --project .\MessageCenter.Worker\MessageCenter.Worker.csproj
@@ -24,21 +27,23 @@ dotnet run --project .\MessageCenter.Worker\MessageCenter.Worker.csproj
 
 ```bash
 curl http://localhost:5000/health
+curl http://localhost:5000/health/outbox
 curl http://localhost:5000/health/worker
 ```
 
-`/health/worker` 在最近 30 秒没有收到独立 Worker 心跳时返回 HTTP 503。
+`/health/outbox` 验证 DM8 可连接；`/health/worker` 在最近 30 秒没有收到独立 Worker 心跳时返回 HTTP 503。
 
 ## 状态与一致性
 
 - Novu 是消息正文及最终已读状态的权威数据源。
+- DM8 `message_send_outbox` 是待发送消息和发送状态的持久记录；建表脚本为 `scripts/message-center-outbox-dm.sql`。
 - Redis 保存消息轻量投影、`all/unread/read` 有序索引、Streams 任务和任务状态。
 - 查询只访问 Redis，不在 HTTP 请求中遍历 Novu 全部消息。
 - Redis 投影不存在时，查询返回 HTTP 202 和 `state=building`，独立 Worker 从 Novu 重建投影。
 - 重建写入任务专属 staging 投影；全部分页成功后原子切换。已有正式投影在重建和重试期间继续可读。
 - Worker 使用 Consumer Group 确认任务；进程退出后的 pending 任务由其他 Worker 回收，不会因出队而丢失。
 - Novu 分页瞬时异常最多重试 3 次，整个任务最多尝试 5 次，并使用指数退避。
-- 新消息只能通过 `POST /send` 进入正式链路；该接口会登记订阅者并触发增量同步。直接绕过 MessageCenter 调用 Novu 不属于受支持的生产契约。
+- 新消息只能通过 `POST /send` 进入正式链路；该接口事务性写入 DM8 Outbox，由 Worker 触发 Novu 并更新 Redis 投影。直接绕过 MessageCenter 调用 Novu 不属于受支持的生产契约。
 
 ## 鉴权
 
@@ -58,6 +63,7 @@ Authorization: Bearer <token>
 
 ```json
 {
+  "requestId": "process-task-TASK_001-created",
   "businessType": "process_task",
   "businessId": "TASK_001",
   "title": "待办提醒",
@@ -69,7 +75,29 @@ Authorization: Bearer <token>
 }
 ```
 
-成功返回 HTTP 201。Novu 工作流异步处理消息，201 表示触发已被接受。
+请求必须携带稳定的 `requestId`。同一来源系统使用相同 `requestId` 和相同内容重试时返回原任务；相同 `requestId` 携带不同内容返回 HTTP 409。
+
+成功落库返回 HTTP 202：
+
+```json
+{
+  "requestId": "process-task-TASK_001-created",
+  "state": "pending",
+  "recipients": [
+    {
+      "sendId": "stable-send-id",
+      "subscriberId": "196045",
+      "state": "pending",
+      "retryCount": 0,
+      "transactionId": null,
+      "error": null
+    }
+  ],
+  "skipped": []
+}
+```
+
+HTTP 202 表示完整消息已事务性写入 DM8，Worker 会使用 `sendId` 作为 Novu `transactionId` 和 `Idempotency-Key` 重试发送。发送状态通过 `GET /api/message-center/send/{requestId}` 查询；失败任务可由 `POST /api/message-center/send/{requestId}/retry` 人工重放。最终状态为 `visible` 时，消息已写入 Redis 查询投影。
 
 ### 查询消息
 

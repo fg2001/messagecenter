@@ -16,6 +16,7 @@ public static class MessageMapper
 
         var payload = new NovuPayloadFields
         {
+            RequestId = request.RequestId,
             SourceSystem = request.SourceSystem ?? string.Empty,
             BusinessType = request.BusinessType,
             BusinessId = request.BusinessId,
@@ -24,7 +25,9 @@ public static class MessageMapper
             Url = request.Url
         };
 
-        foreach (var receiver in request.Receivers)
+        foreach (var receiver in request.Receivers
+                     .GroupBy(x => new { Type = x.Type.ToLowerInvariant(), x.Id })
+                     .Select(x => x.First()))
         {
             if (!string.Equals(receiver.Type, UserReceiverType, StringComparison.OrdinalIgnoreCase))
             {

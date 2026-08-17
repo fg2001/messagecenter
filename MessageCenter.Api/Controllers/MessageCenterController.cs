@@ -1,8 +1,8 @@
 using System.Security.Claims;
-using MessageCenter.Api.Audit;
 using MessageCenter.Api.HttpClients;
 using MessageCenter.Api.Models;
 using MessageCenter.Api.Options;
+using MessageCenter.Api.Outbox;
 using MessageCenter.Api.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -21,7 +21,7 @@ public sealed class MessageCenterController : ControllerBase
     private readonly NovuClient _novu;
     private readonly NovuOptions _options;
     private readonly SourceSystemOptions _sourceSystemOptions;
-    private readonly IAuditSink _audit;
+    private readonly MessageOutboxStore _outbox;
     private readonly MessageProjectionStore _projection;
     private readonly MessageWorkQueue _jobs;
 
@@ -29,14 +29,14 @@ public sealed class MessageCenterController : ControllerBase
         NovuClient novu,
         IOptions<NovuOptions> options,
         IOptions<SourceSystemOptions> sourceSystemOptions,
-        IAuditSink audit,
+        MessageOutboxStore outbox,
         MessageProjectionStore projection,
         MessageWorkQueue jobs)
     {
         _novu = novu;
         _options = options.Value;
         _sourceSystemOptions = sourceSystemOptions.Value;
-        _audit = audit;
+        _outbox = outbox;
         _projection = projection;
         _jobs = jobs;
     }
@@ -72,46 +72,47 @@ public sealed class MessageCenterController : ControllerBase
             });
         }
 
-        var accepted = new List<string>();
-        string? transactionId = null;
-        string? status = null;
-        var acknowledged = false;
-
-        foreach (var trigger in triggers)
+        try
         {
-            var result = await _novu.TriggerAsync(
-                trigger.WorkflowId,
-                trigger.SubscriberId,
-                trigger.Payload,
-                ct);
-
-            accepted.Add(trigger.SubscriberId);
-            transactionId = result.TransactionId;
-            status = result.Status;
-            acknowledged = result.Acknowledged;
-            await _projection.RegisterActiveAsync(trigger.SubscriberId);
-            await _jobs.EnqueueSyncAsync(trigger.SubscriberId);
-
-            _audit.Record(new AuditEntry(
-                result.TransactionId,
+            var response = await _outbox.EnqueueAsync(
                 sourceSystem,
-                request.BusinessType,
-                request.BusinessId,
-                trigger.SubscriberId,
-                StatusCodes.Status200OK,
-                result.Status,
-                result.Acknowledged,
-                DateTime.UtcNow));
+                request,
+                triggers,
+                skipped,
+                ct);
+            return Accepted(response);
         }
-
-        return StatusCode(StatusCodes.Status201Created, new SendMessageResponse
+        catch (MessageOutboxConflictException ex)
         {
-            TransactionId = transactionId,
-            Status = status,
-            Acknowledged = acknowledged,
-            Accepted = accepted,
-            Skipped = skipped
-        });
+            return Conflict(new { error = ex.Message, requestId = request.RequestId });
+        }
+    }
+
+    [HttpGet("send/{requestId}")]
+    public async Task<IActionResult> GetSendStatus(
+        string requestId,
+        CancellationToken ct)
+    {
+        var sourceSystem = GetSourceSystem();
+        if (sourceSystem.Result is not null) return sourceSystem.Result;
+
+        var response = await _outbox.GetRequestAsync(sourceSystem.Name!, requestId, ct);
+        return response is null ? NotFound() : Ok(response);
+    }
+
+    [HttpPost("send/{requestId}/retry")]
+    public async Task<IActionResult> RetrySend(
+        string requestId,
+        CancellationToken ct)
+    {
+        var sourceSystem = GetSourceSystem();
+        if (sourceSystem.Result is not null) return sourceSystem.Result;
+
+        var retried = await _outbox.RetryFailedAsync(sourceSystem.Name!, requestId, ct);
+        if (!retried) return NotFound(new { error = "No failed recipients were found." });
+
+        var response = await _outbox.GetRequestAsync(sourceSystem.Name!, requestId, ct);
+        return Accepted(response);
     }
 
     [HttpGet("my")]
@@ -240,5 +241,28 @@ public sealed class MessageCenterController : ControllerBase
     {
         var username = User.FindFirstValue("preferred_username");
         return string.IsNullOrWhiteSpace(username) ? null : username;
+    }
+
+    private (string? Name, IActionResult? Result) GetSourceSystem()
+    {
+        var clientId = GetPreferredUsername();
+        if (clientId is null)
+        {
+            return (null, Unauthorized(new
+            {
+                error = "preferred_username claim is missing from token."
+            }));
+        }
+
+        if (!_sourceSystemOptions.Names.TryGetValue(clientId, out var sourceSystem))
+        {
+            return (null, StatusCode(StatusCodes.Status403Forbidden, new
+            {
+                error = $"Client '{clientId}' is not registered in SourceSystemNames.",
+                clientId
+            }));
+        }
+
+        return (sourceSystem, null);
     }
 }

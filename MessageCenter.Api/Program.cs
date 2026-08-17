@@ -1,9 +1,11 @@
-using MessageCenter.Api.Audit;
+using MessageCenter.Api.Data;
 using MessageCenter.Api.HttpClients;
 using MessageCenter.Api.Middleware;
 using MessageCenter.Api.Options;
+using MessageCenter.Api.Outbox;
 using MessageCenter.Api.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
 using System.Net.Http.Headers;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
@@ -20,6 +22,10 @@ builder.Services.Configure<SourceSystemOptions>(options =>
 });
 builder.Services.Configure<RedisOptions>(
     builder.Configuration.GetSection(RedisOptions.Section));
+var messageCenterConnectionString =
+    builder.Configuration.GetConnectionString("MessageCenter");
+builder.Services.AddDbContext<MessageCenterDbContext>(options =>
+    options.UseDm(messageCenterConnectionString));
 builder.Services.AddHttpClient<NovuClient>((sp, client) =>
 {
     var novuOptions = sp.GetRequiredService<IOptions<NovuOptions>>().Value;
@@ -30,7 +36,7 @@ builder.Services.AddHttpClient<NovuClient>((sp, client) =>
         new AuthenticationHeaderValue("ApiKey", novuOptions.ApiKey);
 });
 // Polly extension point: add .AddPolicyHandler(...) to the NovuClient IHttpClientBuilder when retries are introduced.
-builder.Services.AddSingleton<IAuditSink, LoggerAuditSink>();
+builder.Services.AddScoped<MessageOutboxStore>();
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 {
     var options = sp.GetRequiredService<IOptions<RedisOptions>>().Value;
@@ -58,6 +64,12 @@ builder.Services
 builder.Services.AddAuthorization();
 
 var app = builder.Build();
+
+if (string.IsNullOrWhiteSpace(messageCenterConnectionString))
+{
+    throw new InvalidOperationException(
+        "ConnectionStrings:MessageCenter is required.");
+}
 
 var novu = app.Services.GetRequiredService<IOptions<NovuOptions>>().Value;
 if (string.IsNullOrWhiteSpace(novu.BaseUrl))
@@ -87,6 +99,12 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/health/outbox", async (MessageOutboxStore outbox, CancellationToken ct) =>
+    await outbox.CanConnectAsync(ct)
+        ? Results.Ok(new { status = "ok" })
+        : Results.Json(
+            new { status = "unavailable" },
+            statusCode: StatusCodes.Status503ServiceUnavailable));
 app.MapGet("/health/worker", async (MessageWorkQueue queue) =>
 {
     var heartbeat = await queue.GetHeartbeatAsync();

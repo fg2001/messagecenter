@@ -10,6 +10,7 @@ public class TriggerResult
 public class NovuMessageItem
 {
     public string? Id { get; set; }
+    public string? TransactionId { get; set; }
     public string? Subject { get; set; }
     public string? Content { get; set; }
     public NovuMessagePayload? Payload { get; set; }
@@ -21,6 +22,8 @@ public class NovuMessageItem
 
 public class NovuMessagePayload
 {
+    public string? RequestId { get; set; }
+    public string? SendId { get; set; }
     public string? SourceSystem { get; set; }
     public string? BusinessType { get; set; }
     public string? BusinessId { get; set; }
