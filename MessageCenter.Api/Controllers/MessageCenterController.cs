@@ -62,7 +62,15 @@ public sealed class MessageCenterController : ControllerBase
         }
 
         request.SourceSystem = sourceSystem;
-        var triggers = MessageMapper.Map(request, _options.DefaultWorkflowId, out var skipped);
+        if (!_options.TryGetWorkflow(sourceSystem, out var workflowId))
+        {
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+            {
+                code = "SOURCE_WORKFLOW_UNAVAILABLE",
+                error = "The registered source workflow is not configured."
+            });
+        }
+        var triggers = MessageMapper.Map(request, workflowId, out var skipped);
         if (triggers.Count == 0)
         {
             return BadRequest(new

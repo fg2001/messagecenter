@@ -57,6 +57,24 @@ Authorization: Bearer <token>
 
 ## API 契约
 
+### 按来源选择工作流
+
+默认继续使用`Novu:DefaultWorkflowId`。需要独立渠道的已登记来源可设置：
+
+```json
+{
+  "Novu": {
+    "SourceWorkflows": { "micip": "micip-reminder" }
+  }
+}
+```
+
+环境变量对应`Novu__SourceWorkflows__micip=micip-reminder`。键是MC服务端`SourceSystemNames`映射的来源值，不是客户端自报的`sourceSystem`或服务用户名。发送鉴权和来源登记保持，正文不能选择工作流；未配置的来源继续使用原默认工作流。显式配置空值返回503/`SOURCE_WORKFLOW_UNAVAILABLE`，不会降回共享工作流。
+
+工作流须在Novu预先配置并验证渠道及测试接收人；此配置不创建工作流，也不保证主动提醒额度、截止时间或最终送达。API与Worker无需新增表或请求字段，Worker继续使用Outbox已保存的工作流。配置调整仅影响新受理请求；同键同载荷重放返回原结果，重试使用原行的工作流，不会改投新工作流。配置切换前须排查未确定请求并保留原键，不能换键规避不确定状态。
+
+回退时先暂停受影响来源的新发送，保留已入账任务和原工作流；撤销本项配置不会撤回已发送消息或重写Outbox。共享默认工作流及其他来源配置无需修改。
+
 ### 发送消息
 
 `POST /api/message-center/send`
