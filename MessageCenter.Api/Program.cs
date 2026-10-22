@@ -19,6 +19,7 @@ builder.Services.Configure<NovuOptions>(
 builder.Services.Configure<SourceSystemOptions>(options =>
 {
     builder.Configuration.GetSection(SourceSystemOptions.Section).Bind(options.Names);
+    builder.Configuration.GetSection("SourceServiceIdentities").Bind(options.ServiceIdentities);
 });
 builder.Services.Configure<RedisOptions>(
     builder.Configuration.GetSection(RedisOptions.Section));

@@ -57,6 +57,33 @@ Authorization: Bearer <token>
 
 ## API 契约
 
+### 受保护来源的服务身份
+
+原有`SourceSystemNames`登记保持。需要限制为专用服务Token的来源可增加：
+
+```json
+{
+  "SourceServiceIdentities": {
+    "micip": {
+      "Issuer": "<实际issuer>",
+      "Subject": "<实际服务账号sub>",
+      "ClientId": "<实际服务客户端azp>",
+      "Audience": "<MC API受众>"
+    }
+  }
+}
+```
+
+以上是占位示例，不能直接上线。字典键是`SourceSystemNames`的来源值，不是服务用户名或正文自报值。对应环境变量如`SourceServiceIdentities__micip__Subject`。启用前核对实际已验证服务Token的四项声明；不从客户端名推导sub，不输出完整Token或凭据。
+
+发送、发送查询与重试共用来源准入：在现有JWT签名/issuer/有效期认证后，受保护来源要求精确匹配issuer/sub/azp，aud必须包含配置的MC受众。缺失/重复身份声明、未认证人员或不完整配置返回403/`SOURCE_SERVICE_IDENTITY_DENIED`，不访问业务存储或Novu。不采用用户名相同、`client_id`或人员会话作为回退。仅身份配置不能代替来源登记，正文不能改变来源。
+
+未配置保护的其他来源保留原行为；这不是全局JWT受众加固，个人消息接口及未配置来源仍有原认证边界。既有客户端需要逐个盘点后迁移，不能据此宣称所有调用已经安全。HTTP测试issuer可精确配置，不改变现有HTTPS元数据设置；生产传输要求另行验收。
+
+配置错误或凭据/客户端变化后的403不证明原消息未发送；保留requestId与UNKNOWN，修正绑定后查询原键。配置不会创建用户、会话、订阅者、工作流或角色，不同步人员/组织。不新增表或依赖。
+
+回退不得直接删除已生效的身份保护并恢复仅用户名放行。应暂停该来源新发送，必要时撤销其来源登记来封闭所有服务入口，再使用仍具身份约束的兼容代码/配置恢复原键查询；保留Outbox和历史消息。不得通过改名、借用其他来源或换requestId绕过拒绝。真实身份/共享实例兼容、API管道和渠道送达仍需部署验收。
+
 ### 发送消息
 
 `POST /api/message-center/send`
