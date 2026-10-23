@@ -89,9 +89,78 @@ public sealed class SourceServiceIdentityTests
             ["SourceServiceIdentities:micip:Audience"] = "mc-api"
         }).Build();
         var options = Settings(); options.ServiceIdentities.Clear();
-        configuration.GetSection("SourceServiceIdentities").Bind(options.ServiceIdentities);
+        options.Bind(configuration);
         Assert.True(options.AllowsService("micip", User()));
         Assert.False(options.AllowsService("micip", User(new Claim("sub", "person-sub"))));
+    }
+
+    [Theory]
+    [InlineData("{}", "send")]
+    [InlineData("{}", "query")]
+    [InlineData("{}", "retry")]
+    [InlineData("null", "send")]
+    [InlineData("null", "query")]
+    [InlineData("null", "retry")]
+    [InlineData("\"\"", "send")]
+    [InlineData("\"\"", "query")]
+    [InlineData("\"\"", "retry")]
+    public async Task Explicit_empty_json_binding_denies_all_source_endpoints(string value, string endpoint)
+    {
+        using var json = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(
+            "{\"SourceServiceIdentities\":{\"micip\":" + value + "}}"));
+        var configuration = new ConfigurationBuilder().AddJsonStream(json).Build();
+        var options = Settings(); options.ServiceIdentities.Clear();
+        options.Bind(configuration);
+        foreach (var claim in new[] { "iss", "sub", "azp", "aud", "valid" })
+        {
+            var user = new ClaimsPrincipal(new ClaimsIdentity(User().Claims.Where(c => c.Type != claim)
+                .Concat(claim == "valid" ? Array.Empty<Claim>() : new[] { new Claim(claim, "wrong") }), "fixture"));
+            var controller = Controller(user, options);
+            var result = endpoint switch
+            {
+                "send" => await controller.Send(new SendMessageRequest(), CancellationToken.None),
+                "query" => await controller.GetSendStatus("original-request", CancellationToken.None),
+                _ => await controller.RetrySend("original-request", CancellationToken.None)
+            };
+            var denied = Assert.IsType<ObjectResult>(result);
+            Assert.Equal(403, denied.StatusCode);
+            Assert.Contains("SOURCE_SERVICE_IDENTITY_DENIED", System.Text.Json.JsonSerializer.Serialize(denied.Value));
+        }
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("{\"SourceServiceIdentities\":{}}")]
+    public void Absent_source_node_keeps_legacy_compatibility(string value)
+    {
+        using var json = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(value));
+        var configuration = new ConfigurationBuilder().AddJsonStream(json).Build();
+        var options = new SourceSystemOptions(); options.Bind(configuration);
+        Assert.True(options.AllowsService("legacy", User()));
+        Assert.Empty(options.ServiceIdentities);
+    }
+
+    [Fact]
+    public void Json_binding_keeps_valid_and_empty_sources_distinct()
+    {
+        using var json = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(@"{
+            ""SourceSystemNames"": { ""fixture-service"": ""micip"", ""legacy-service"": ""legacy"" },
+            ""SourceServiceIdentities"": {
+                ""micip"": {
+                    ""Issuer"": ""http://isolated-idp.test/realms/test"", ""Subject"": ""service-sub"",
+                    ""ClientId"": ""micip-svc"", ""Audience"": ""mc-api""
+                },
+                ""empty"": {}
+            }
+        }"));
+        var configuration = new ConfigurationBuilder().AddJsonStream(json).Build();
+        var options = new SourceSystemOptions(); options.Bind(configuration);
+        Assert.Equal("micip", options.Names["fixture-service"]);
+        Assert.Equal("legacy", options.Names["legacy-service"]);
+        Assert.True(options.AllowsService("micip", User()));
+        Assert.False(options.AllowsService("micip", User(new Claim("sub", "person-sub"))));
+        Assert.False(options.AllowsService("empty", User()));
+        Assert.True(options.AllowsService("legacy", User()));
     }
 
     [Fact]

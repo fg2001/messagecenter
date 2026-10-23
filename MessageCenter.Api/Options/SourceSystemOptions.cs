@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using Microsoft.Extensions.Configuration;
 
 namespace MessageCenter.Api.Options;
 
@@ -8,6 +9,17 @@ public class SourceSystemOptions
 
     public Dictionary<string, string> Names { get; set; } = new();
     public Dictionary<string, SourceServiceIdentity> ServiceIdentities { get; set; } = new();
+
+    public void Bind(IConfiguration configuration)
+    {
+        configuration.GetSection(Section).Bind(Names);
+        foreach (var source in configuration.GetSection("SourceServiceIdentities").GetChildren())
+        {
+            var identity = new SourceServiceIdentity();
+            source.Bind(identity);
+            ServiceIdentities[source.Key] = identity;
+        }
+    }
 
     public bool AllowsService(string sourceSystem, ClaimsPrincipal user)
         => !ServiceIdentities.TryGetValue(sourceSystem, out var identity) || identity.Matches(user);
