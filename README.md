@@ -86,6 +86,26 @@ Authorization: Bearer <token>
 
 回退不得直接删除已生效的身份保护并恢复仅用户名放行。应暂停该来源新发送，必要时撤销其来源登记来封闭所有服务入口，再使用仍具身份约束的兼容代码/配置恢复原键查询；保留Outbox和历史消息。不得通过改名、借用其他来源或换requestId绕过拒绝。真实身份/共享实例兼容、API管道和渠道送达仍需部署验收。
 
+
+
+### 按来源选择工作流
+
+默认继续使用`Novu:DefaultWorkflowId`。需要独立渠道的已登记来源可设置：
+
+```json
+{
+  "Novu": {
+    "SourceWorkflows": { "micip": "micip-reminder" }
+  }
+}
+```
+
+环境变量对应`Novu__SourceWorkflows__micip=micip-reminder`。键是MC服务端`SourceSystemNames`映射的来源值，不是客户端自报的`sourceSystem`或服务用户名。发送鉴权和来源登记保持，正文不能选择工作流；未配置的来源继续使用原默认工作流。显式配置空值返回503/`SOURCE_WORKFLOW_UNAVAILABLE`，不会降回共享工作流。
+
+工作流须在Novu预先配置并验证渠道及测试接收人；此配置不创建工作流，也不保证主动提醒额度、截止时间或最终送达。API与Worker无需新增表或请求字段，Worker继续使用Outbox已保存的工作流。配置调整仅影响新受理请求；同键同载荷重放返回原结果，重试使用原行的工作流，不会改投新工作流。配置切换前须排查未确定请求并保留原键，不能换键规避不确定状态。
+
+回退时先暂停受影响来源的新发送，保留已入账任务和原工作流；撤销本项配置不会撤回已发送消息或重写Outbox。共享默认工作流及其他来源配置无需修改。
+
 ### 发送消息
 
 `POST /api/message-center/send`
@@ -292,3 +312,8 @@ dotnet restore .\MessageCenter.Worker\MessageCenter.Worker.csproj -r linux-x64
 dotnet publish .\MessageCenter.Worker\MessageCenter.Worker.csproj `
   -c Release -r linux-x64 --self-contained true --no-restore
 ```
+## Novu 触发回执与原键
+
+触发客户端要求成功 HTTP 响应中的 `data.transactionId` 与本次发送的 `sendId` 精确一致（区分大小写，不裁剪空白）。缺失、空值或不匹配均抛出固定错误 `Novu trigger transaction mismatch.`，不把其他事务的回执写成本事务 accepted。Worker 继续使用既有失败路径、原 Outbox 行、工作流、载荷和原键；不新建请求、不返还 MICIP 额度。错误日志不包含对端返回的错误事务 ID。
+
+此检查只证明回执关联，不证明送达、已读或业务处理，也不能证明异常响应对应的原请求从未受理。现有 MC 自动原键重试仍依赖 Novu 幂等保留窗口；配置和实际版本须单独核验，窗口过期、截止执行、跨日和 UNKNOWN 结算不由本补丁保证。`AcceptedAt` 是本地收到成功回执的观察时间，不能代替真实平台受理日；MC 202 和查询404均不作最终送达/未发送证明。无请求字段、表、依赖或部署配置变更。
