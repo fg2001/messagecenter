@@ -112,6 +112,47 @@ public sealed class MessageCenterController : ControllerBase
         return Accepted(response);
     }
 
+    /// <summary>严格来源 uncertain 触发的人工对账：原来源令牌方可操作本来源原键。
+    /// CONFIRM_SENT 终结为已受理继续可见性投影；CONFIRM_NOT_SENT 以原 transactionId 恢复单次重发。</summary>
+    [HttpPost("send/{requestId}/resolve-trigger")]
+    public async Task<IActionResult> ResolveTrigger(
+        string requestId,
+        [FromBody] ResolveTriggerRequest body,
+        CancellationToken ct)
+    {
+        var sourceSystem = GetSourceSystem();
+        if (sourceSystem.Result is not null) return sourceSystem.Result;
+
+        if (string.IsNullOrWhiteSpace(body?.SendId)
+            || (body.Resolution != "CONFIRM_SENT" && body.Resolution != "CONFIRM_NOT_SENT"))
+        {
+            return BadRequest(new
+            {
+                error = "sendId is required and resolution must be CONFIRM_SENT or CONFIRM_NOT_SENT."
+            });
+        }
+
+        try
+        {
+            await _outbox.ResolveTriggerUncertainAsync(
+                sourceSystem.Name!, requestId, body.SendId, body.Resolution, ct);
+        }
+        catch (MessageOutboxConflictException)
+        {
+            return NotFound(new
+            {
+                error = "No recipient was found for this request and sendId under this source."
+            });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Conflict(new { error = ex.Message });
+        }
+
+        var response = await _outbox.GetRequestAsync(sourceSystem.Name!, requestId, ct);
+        return Ok(response);
+    }
+
     [HttpGet("my")]
     public async Task<IActionResult> GetMyMessages(
         [FromQuery] string view = "all",

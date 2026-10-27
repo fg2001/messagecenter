@@ -39,6 +39,10 @@ public sealed class MessageCenterDbContext : DbContext
         entity.Property(x => x.AcceptedAt).HasColumnName("accepted_at");
         entity.Property(x => x.VisibleAt).HasColumnName("visible_at");
         entity.Property(x => x.FailedAt).HasColumnName("failed_at");
+        entity.Property(x => x.TriggerAttempts).HasColumnName("trigger_attempts").HasDefaultValue(0);
+        entity.Property(x => x.LastTriggerAt).HasColumnName("last_trigger_at");
+        entity.Property(x => x.UncertainAt).HasColumnName("uncertain_at");
+        entity.Property(x => x.UncertainResolution).HasColumnName("uncertain_resolution").HasMaxLength(32);
 
         entity.HasIndex(x => new { x.SourceSystem, x.RequestId, x.SubscriberId })
             .IsUnique()

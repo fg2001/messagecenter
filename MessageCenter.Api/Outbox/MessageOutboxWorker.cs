@@ -14,6 +14,7 @@ public sealed class MessageOutboxWorker : BackgroundService
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly MessageWorkerOptions _options;
+    private readonly NovuOptions _novuOptions;
     private readonly ILogger<MessageOutboxWorker> _logger;
     private readonly string _worker =
         $"{Environment.MachineName}-{Environment.ProcessId}-{Guid.NewGuid():N}";
@@ -21,10 +22,12 @@ public sealed class MessageOutboxWorker : BackgroundService
     public MessageOutboxWorker(
         IServiceScopeFactory scopeFactory,
         IOptions<MessageWorkerOptions> options,
+        IOptions<NovuOptions> novuOptions,
         ILogger<MessageOutboxWorker> logger)
     {
         _scopeFactory = scopeFactory;
         _options = options.Value;
+        _novuOptions = novuOptions.Value;
         _logger = logger;
     }
 
@@ -100,6 +103,7 @@ public sealed class MessageOutboxWorker : BackgroundService
         {
             var payload = DeserializePayload(item);
             var novu = services.GetRequiredService<NovuClient>();
+            await store.MarkTriggerAttemptAsync(item.SendId, _worker, ct);
             var result = await novu.TriggerAsync(
                 item.WorkflowId,
                 item.SubscriberId,
@@ -121,6 +125,26 @@ public sealed class MessageOutboxWorker : BackgroundService
                 item.SendId,
                 item.SubscriberId,
                 result.TransactionId);
+        }
+        // 严格来源：触发结果不确定（请求可能已被 Novu 受理）→ 冻结 uncertain，不自动重发同键请求，
+        // 等待原操作查询或人工对账（POST /send/{requestId}/resolve-trigger）收敛。
+        catch (NovuTriggerUncertainException ex) when (
+            !ct.IsCancellationRequested && _novuOptions.IsStrictTriggerSource(item.SourceSystem))
+        {
+            await store.MarkTriggerUncertainAsync(item.SendId, _worker, ex.Message, ct);
+            _logger.LogError(
+                ex,
+                "Trigger outcome uncertain. SendId={SendId} frozen as uncertain; manual reconciliation required.",
+                item.SendId);
+        }
+        catch (NovuTriggerReceiptMismatchException ex) when (
+            !ct.IsCancellationRequested && _novuOptions.IsStrictTriggerSource(item.SourceSystem))
+        {
+            await store.MarkTriggerUncertainAsync(item.SendId, _worker, ex.Message, ct);
+            _logger.LogError(
+                ex,
+                "Trigger receipt mismatch on strict source. SendId={SendId} frozen as uncertain.",
+                item.SendId);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {

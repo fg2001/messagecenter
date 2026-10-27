@@ -23,4 +23,12 @@ public sealed class MessageOutboxEntity
     public DateTime? AcceptedAt { get; set; }
     public DateTime? VisibleAt { get; set; }
     public DateTime? FailedAt { get; set; }
+
+    /// <summary>触发尝试次数（每次真正 POST 前递增，含最终成功的一次）。</summary>
+    public int TriggerAttempts { get; set; }
+    public DateTime? LastTriggerAt { get; set; }
+    /// <summary>进入 uncertain 的时间；触发结果不确定期间非空。</summary>
+    public DateTime? UncertainAt { get; set; }
+    /// <summary>人工对账结论：CONFIRM_SENT / CONFIRM_NOT_SENT；未对账为空。</summary>
+    public string? UncertainResolution { get; set; }
 }

@@ -17,6 +17,19 @@ public sealed class SendRecipientResponse
     public int RetryCount { get; init; }
     public string? TransactionId { get; init; }
     public string? Error { get; init; }
+    /// <summary>已向 Novu 发起的触发尝试次数；触发结果不确定期间 state=uncertain。</summary>
+    public int TriggerAttempts { get; init; }
+    public DateTime? UncertainAt { get; init; }
+    /// <summary>不确定窗口的人工对账结论：CONFIRM_SENT / CONFIRM_NOT_SENT；未对账为空。</summary>
+    public string? UncertainResolution { get; init; }
+}
+
+public sealed class ResolveTriggerRequest
+{
+    public string SendId { get; init; } = string.Empty;
+    /// <summary>CONFIRM_SENT 或 CONFIRM_NOT_SENT。</summary>
+    public string Resolution { get; init; } = string.Empty;
+    public string? Note { get; init; }
 }
 
 public sealed class SendRequestStatusResponse

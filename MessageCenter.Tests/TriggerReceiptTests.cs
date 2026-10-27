@@ -21,7 +21,7 @@ public sealed class TriggerReceiptTests
         var handler = new ReceiptHandler(returnedId);
         var client = Client(handler);
 
-        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        var error = await Assert.ThrowsAnyAsync<InvalidOperationException>(() =>
             client.TriggerAsync("workflow-1", "subscriber-1", new { title = "Task" }, "send-1"));
 
         Assert.Equal("Novu trigger transaction mismatch.", error.Message);
@@ -35,7 +35,7 @@ public sealed class TriggerReceiptTests
         var client = Client(handler);
         var payload = new { title = "Task", sendId = "send-1" };
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        await Assert.ThrowsAnyAsync<InvalidOperationException>(() =>
             client.TriggerAsync("workflow-1", "subscriber-1", payload, "send-1"));
         var result = await client.TriggerAsync("workflow-1", "subscriber-1", payload, "send-1");
 

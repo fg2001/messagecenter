@@ -16,7 +16,8 @@ public sealed record ClaimedMessageOutboxItem(
     string Payload,
     string Status,
     int RetryCount,
-    string? NovuTransactionId);
+    string? NovuTransactionId,
+    string SourceSystem);
 
 public sealed class MessageOutboxConflictException : Exception
 {
@@ -194,7 +195,8 @@ WHERE ""send_id"" = {sendId}
                 x.Payload,
                 x.Status,
                 x.RetryCount,
-                x.NovuTransactionId))
+                x.NovuTransactionId,
+                x.SourceSystem))
             .ToListAsync(ct);
     }
 
@@ -215,8 +217,92 @@ WHERE ""send_id"" = {sendId}
         entity.LockedBy = null;
         entity.LockedUntil = null;
         entity.LastError = null;
+        // 成功受理即终结任何不确定窗口（例如此前一次 uncertain 后人工确认前恰好重试成功）。
+        entity.UncertainAt = null;
         entity.UpdatedAt = now;
         await _db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>每次真正向 Novu 发起 POST 前记录一次尝试，供不确定窗口审计与对账。</summary>
+    public async Task MarkTriggerAttemptAsync(string sendId, string worker, CancellationToken ct)
+    {
+        var entity = await FindClaimedAsync(sendId, worker, ct);
+        entity.TriggerAttempts++;
+        entity.LastTriggerAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>严格来源触发结果不确定：冻结为 uncertain，不再被认领，不自动重发同键请求。</summary>
+    public async Task MarkTriggerUncertainAsync(
+        string sendId,
+        string worker,
+        string error,
+        CancellationToken ct)
+    {
+        var entity = await FindClaimedAsync(sendId, worker, ct);
+        entity.Status = MessageOutboxState.Uncertain;
+        entity.UncertainAt = DateTime.UtcNow;
+        entity.UncertainResolution = null;
+        entity.NextRetryAt = null;
+        entity.LockedBy = null;
+        entity.LockedUntil = null;
+        entity.LastError = Truncate("TRIGGER_UNCERTAIN:" + error);
+        entity.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>人工对账收敛 uncertain：CONFIRM_SENT 按已受理继续可见性投影；
+    /// CONFIRM_NOT_SENT 恢复 pending 并沿用原 transactionId 重发一次（Novu 幂等兜底去重）。</summary>
+    public async Task<MessageOutboxEntity> ResolveTriggerUncertainAsync(
+        string sourceSystem,
+        string requestId,
+        string sendId,
+        string resolution,
+        CancellationToken ct)
+    {
+        var entity = await _db.MessageOutbox.FirstOrDefaultAsync(
+            x => x.SourceSystem == sourceSystem
+                 && x.RequestId == requestId
+                 && x.SendId == sendId,
+            ct);
+        if (entity is null)
+            throw new MessageOutboxConflictException(requestId);
+        if (entity.Status != MessageOutboxState.Uncertain)
+            throw new InvalidOperationException(
+                $"Send '{sendId}' is not in uncertain state (current: {entity.Status}).");
+        if (entity.LockedBy is not null)
+            throw new InvalidOperationException(
+                $"Send '{sendId}' is currently leased by worker '{entity.LockedBy}'.");
+
+        var now = DateTime.UtcNow;
+        entity.UncertainResolution = resolution;
+        if (string.Equals(resolution, "CONFIRM_SENT", StringComparison.Ordinal))
+        {
+            entity.Status = MessageOutboxState.Accepted;
+            entity.NovuTransactionId ??= entity.SendId;
+            entity.NovuStatus = "manual-confirm-sent";
+            entity.AcceptedAt ??= now;
+            entity.NextRetryAt = now;
+        }
+        else if (string.Equals(resolution, "CONFIRM_NOT_SENT", StringComparison.Ordinal))
+        {
+            entity.Status = MessageOutboxState.Pending;
+            entity.RetryCount++;
+            entity.NovuTransactionId = null;
+            entity.NovuStatus = null;
+            entity.NextRetryAt = now;
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "Resolution must be CONFIRM_SENT or CONFIRM_NOT_SENT.");
+        }
+
+        entity.LockedBy = null;
+        entity.LockedUntil = null;
+        entity.UpdatedAt = now;
+        await _db.SaveChangesAsync(ct);
+        return entity;
     }
 
     public async Task MarkVisibleAsync(
@@ -370,12 +456,16 @@ WHERE ""send_id"" = {sendId}
             State = entity.Status,
             RetryCount = entity.RetryCount,
             TransactionId = entity.NovuTransactionId,
-            Error = entity.LastError
+            Error = entity.LastError,
+            TriggerAttempts = entity.TriggerAttempts,
+            UncertainAt = entity.UncertainAt,
+            UncertainResolution = entity.UncertainResolution
         };
 
     private static string AggregateState(IReadOnlyList<MessageOutboxEntity> entities)
     {
         if (entities.All(x => x.Status == MessageOutboxState.Visible)) return MessageOutboxState.Visible;
+        if (entities.Any(x => x.Status == MessageOutboxState.Uncertain)) return MessageOutboxState.Uncertain;
         if (entities.Any(x => x.Status == MessageOutboxState.Failed)) return MessageOutboxState.Failed;
         if (entities.Any(x => x.Status == MessageOutboxState.Accepted)) return MessageOutboxState.Accepted;
         return MessageOutboxState.Pending;

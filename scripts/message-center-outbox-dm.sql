@@ -23,9 +23,13 @@ CREATE TABLE IF NOT EXISTS "message_send_outbox" (
     "accepted_at"         TIMESTAMP(6) NULL,
     "visible_at"          TIMESTAMP(6) NULL,
     "failed_at"           TIMESTAMP(6) NULL,
+    "trigger_attempts"    INT DEFAULT 0 NOT NULL,
+    "last_trigger_at"     TIMESTAMP(6) NULL,
+    "uncertain_at"        TIMESTAMP(6) NULL,
+    "uncertain_resolution" VARCHAR2(32) NULL,
     CONSTRAINT "pk_message_send_outbox" PRIMARY KEY ("send_id"),
     CONSTRAINT "ck_message_send_outbox_status"
-        CHECK ("status" IN ('pending', 'accepted', 'visible', 'failed')),
+        CHECK ("status" IN ('pending', 'accepted', 'visible', 'failed', 'uncertain')),
     CONSTRAINT "ux_msg_outbox_request_receiver"
         UNIQUE ("source_system", "request_id", "subscriber_id")
 );
