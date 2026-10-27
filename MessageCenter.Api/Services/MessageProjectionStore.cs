@@ -300,6 +300,47 @@ public sealed class MessageProjectionStore
             }, JsonOptions));
     }
 
+    /// <summary>从收件箱投影移除一条消息（撤回/过期收敛）：主键集合与三个视图同步删除，
+    /// 进行中的 rebuild 代际键同样处理，避免重建把终态消息带回。</summary>
+    public async Task RemoveAsync(string subscriberId, string messageId)
+    {
+        await RemoveFromKeysAsync(
+            MessagesKey(subscriberId),
+            AllKey(subscriberId),
+            UnreadKey(subscriberId),
+            ReadKey(subscriberId),
+            messageId);
+
+        var generation = await _redis.StringGetAsync(ActiveRebuildKey(subscriberId));
+        if (!generation.HasValue) return;
+
+        await RemoveFromKeysAsync(
+            RebuildMessagesKey(subscriberId, generation!),
+            RebuildAllKey(subscriberId, generation!),
+            RebuildUnreadKey(subscriberId, generation!),
+            RebuildReadKey(subscriberId, generation!),
+            messageId);
+    }
+
+    private async Task RemoveFromKeysAsync(
+        RedisKey messagesKey,
+        RedisKey allKey,
+        RedisKey unreadKey,
+        RedisKey readKey,
+        string messageId)
+    {
+        var batch = _redis.CreateBatch();
+        var tasks = new List<Task>
+        {
+            batch.HashDeleteAsync(messagesKey, messageId),
+            batch.SortedSetRemoveAsync(allKey, messageId),
+            batch.SortedSetRemoveAsync(unreadKey, messageId),
+            batch.SortedSetRemoveAsync(readKey, messageId)
+        };
+        batch.Execute();
+        await Task.WhenAll(tasks);
+    }
+
     public async Task<IReadOnlyList<string>> GetUnreadIdsAsync(
         string subscriberId,
         int limit)

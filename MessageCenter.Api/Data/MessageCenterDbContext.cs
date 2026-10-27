@@ -11,6 +11,8 @@ public sealed class MessageCenterDbContext : DbContext
     }
 
     public DbSet<MessageOutboxEntity> MessageOutbox => Set<MessageOutboxEntity>();
+    public DbSet<MessageLifecycleOperationEntity> MessageLifecycleOperations
+        => Set<MessageLifecycleOperationEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -43,6 +45,11 @@ public sealed class MessageCenterDbContext : DbContext
         entity.Property(x => x.LastTriggerAt).HasColumnName("last_trigger_at");
         entity.Property(x => x.UncertainAt).HasColumnName("uncertain_at");
         entity.Property(x => x.UncertainResolution).HasColumnName("uncertain_resolution").HasMaxLength(32);
+        entity.Property(x => x.BusinessState).HasColumnName("business_state").HasMaxLength(16)
+            .HasDefaultValue("ACTIVE");
+        entity.Property(x => x.BusinessVersion).HasColumnName("business_version").HasDefaultValue(0L);
+        entity.Property(x => x.TerminalAt).HasColumnName("terminal_at");
+        entity.Property(x => x.TerminalReason).HasColumnName("terminal_reason").HasMaxLength(2000);
 
         entity.HasIndex(x => new { x.SourceSystem, x.RequestId, x.SubscriberId })
             .IsUnique()
@@ -53,5 +60,27 @@ public sealed class MessageCenterDbContext : DbContext
             .HasDatabaseName("ix_msg_outbox_request");
         entity.HasIndex(x => x.LockedUntil)
             .HasDatabaseName("ix_msg_outbox_lock");
+
+        var lifecycle = modelBuilder.Entity<MessageLifecycleOperationEntity>();
+        lifecycle.ToTable("message_lifecycle_operation");
+        lifecycle.HasKey(x => new { x.SourceSystem, x.OperationId });
+        lifecycle.Property(x => x.OperationId).HasColumnName("operation_id").HasMaxLength(128);
+        lifecycle.Property(x => x.SourceSystem).HasColumnName("source_system").HasMaxLength(128);
+        lifecycle.Property(x => x.RequestId).HasColumnName("request_id").HasMaxLength(128);
+        lifecycle.Property(x => x.SubscriberId).HasColumnName("subscriber_id").HasMaxLength(128);
+        lifecycle.Property(x => x.SendId).HasColumnName("send_id").HasMaxLength(64);
+        lifecycle.Property(x => x.Action).HasColumnName("action").HasMaxLength(16);
+        lifecycle.Property(x => x.BusinessVersion).HasColumnName("business_version");
+        lifecycle.Property(x => x.Reason).HasColumnName("reason").HasMaxLength(2000);
+        lifecycle.Property(x => x.OperationHash).HasColumnName("operation_hash").HasMaxLength(64);
+        lifecycle.Property(x => x.ApplyStatus).HasColumnName("apply_status").HasMaxLength(16);
+        lifecycle.Property(x => x.ResultBusinessState).HasColumnName("result_business_state").HasMaxLength(16);
+        lifecycle.Property(x => x.OccurredAt).HasColumnName("occurred_at");
+        lifecycle.Property(x => x.RecordedAt).HasColumnName("recorded_at");
+        lifecycle.Property(x => x.AppliedAt).HasColumnName("applied_at");
+        lifecycle.HasIndex(x => new { x.SourceSystem, x.RequestId, x.SubscriberId })
+            .HasDatabaseName("ix_msg_lifecycle_request");
+        lifecycle.HasIndex(x => new { x.SourceSystem, x.RequestId, x.ApplyStatus })
+            .HasDatabaseName("ix_msg_lifecycle_deferred");
     }
 }

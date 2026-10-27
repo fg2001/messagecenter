@@ -119,7 +119,7 @@ public sealed class SourceServiceIdentityTests
             var result = endpoint switch
             {
                 "send" => await controller.Send(new SendMessageRequest(), CancellationToken.None),
-                "query" => await controller.GetSendStatus("original-request", CancellationToken.None),
+                "query" => await controller.GetSendStatus("original-request"),
                 _ => await controller.RetrySend("original-request", CancellationToken.None)
             };
             var denied = Assert.IsType<ObjectResult>(result);
@@ -194,7 +194,7 @@ public sealed class SourceServiceIdentityTests
         var result = endpoint switch
         {
             "send" => await controller.Send(new SendMessageRequest { SourceSystem = "legacy" }, CancellationToken.None),
-            "query" => await controller.GetSendStatus("original-request", CancellationToken.None),
+            "query" => await controller.GetSendStatus("original-request"),
             _ => await controller.RetrySend("original-request", CancellationToken.None)
         };
         var denied = Assert.IsType<ObjectResult>(result);
@@ -221,7 +221,8 @@ public sealed class SourceServiceIdentityTests
     }
 
     private static MessageCenterController Controller(ClaimsPrincipal user, SourceSystemOptions options)
-        => new(null!, Options.Create(new NovuOptions()), Options.Create(options), null!, null!, null!)
+        => new(null!, Options.Create(new NovuOptions()), Options.Create(options),
+            Options.Create(new MessageWorkerOptions()), null!, null!, null!, null!, null!)
         {
             ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext { User = user } }
         };

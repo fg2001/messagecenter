@@ -31,4 +31,12 @@ public sealed class MessageOutboxEntity
     public DateTime? UncertainAt { get; set; }
     /// <summary>人工对账结论：CONFIRM_SENT / CONFIRM_NOT_SENT；未对账为空。</summary>
     public string? UncertainResolution { get; set; }
+
+    /// <summary>业务状态（T-INT-01 §6）：ACTIVE 默认；CONSUMED/REVOKED/EXPIRED 终态。
+    /// 与回执状态正交：终态标记不回写回执历史，仅在未投递时抑制发送（suppressed）。</summary>
+    public string BusinessState { get; set; } = MessageBusinessState.Active;
+    /// <summary>最近一次生效的生命周期操作版本；防倒退基准（≤ 当前值的操作被 422 拒绝）。</summary>
+    public long BusinessVersion { get; set; }
+    public DateTime? TerminalAt { get; set; }
+    public string? TerminalReason { get; set; }
 }

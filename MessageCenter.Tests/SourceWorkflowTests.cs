@@ -42,7 +42,7 @@ public sealed class SourceWorkflowTests
             Options.Create(new SourceSystemOptions
             {
                 Names = new() { ["fixture-service"] = "micip" }
-            }), null!, null!, null!)
+            }), Options.Create(new MessageWorkerOptions()), null!, null!, null!, null!, null!)
         {
             ControllerContext = new ControllerContext
             {

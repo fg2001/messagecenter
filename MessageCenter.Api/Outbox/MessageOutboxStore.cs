@@ -15,6 +15,7 @@ public sealed record ClaimedMessageOutboxItem(
     string WorkflowId,
     string Payload,
     string Status,
+    string BusinessState,
     int RetryCount,
     string? NovuTransactionId,
     string SourceSystem);
@@ -96,6 +97,20 @@ public sealed class MessageOutboxStore
         {
             _db.MessageOutbox.AddRange(entities);
             await _db.SaveChangesAsync(ct);
+
+            // 迟到的 send 受理：立即套用按原键暂存的终止标记（T-INT-01 §6），
+            // 受理审计保留（行存在），但状态置 suppressed——Worker 不再向 Novu 触发。
+            var deferredMarkers = await _db.MessageLifecycleOperations
+                .Where(x => x.SourceSystem == sourceSystem
+                            && x.RequestId == request.RequestId
+                            && x.ApplyStatus == MessageLifecycleApplyStatus.Deferred)
+                .ToListAsync(ct);
+            if (deferredMarkers.Count > 0)
+            {
+                MessageLifecycleStore.ApplyDeferredMarkers(deferredMarkers, entities, now);
+                await _db.SaveChangesAsync(ct);
+            }
+
             await transaction.CommitAsync(ct);
             return MapSendResponse(request.RequestId, entities, skipped);
         }
@@ -114,13 +129,26 @@ public sealed class MessageOutboxStore
     public async Task<SendRequestStatusResponse?> GetRequestAsync(
         string sourceSystem,
         string requestId,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool includeTerminal = false)
     {
         var entities = await FindRequestAsync(sourceSystem, requestId, ct);
         return entities.Count == 0
             ? null
-            : MapStatusResponse(requestId, entities);
+            : MapStatusResponse(requestId, entities, includeTerminal);
     }
+
+    /// <summary>按原键（source + requestId + subscriberId）取收件人行（唯一索引保证至多一行）。</summary>
+    public Task<MessageOutboxEntity?> FindRecipientAsync(
+        string sourceSystem,
+        string requestId,
+        string subscriberId,
+        CancellationToken ct)
+        => _db.MessageOutbox.AsNoTracking().FirstOrDefaultAsync(
+            x => x.SourceSystem == sourceSystem
+                 && x.RequestId == requestId
+                 && x.SubscriberId == subscriberId,
+            ct);
 
     public async Task<bool> RetryFailedAsync(
         string sourceSystem,
@@ -194,6 +222,7 @@ WHERE ""send_id"" = {sendId}
                 x.WorkflowId,
                 x.Payload,
                 x.Status,
+                x.BusinessState,
                 x.RetryCount,
                 x.NovuTransactionId,
                 x.SourceSystem))
@@ -223,13 +252,26 @@ WHERE ""send_id"" = {sendId}
         await _db.SaveChangesAsync(ct);
     }
 
-    /// <summary>每次真正向 Novu 发起 POST 前记录一次尝试，供不确定窗口审计与对账。</summary>
-    public async Task MarkTriggerAttemptAsync(string sendId, string worker, CancellationToken ct)
+    /// <summary>每次真正向 Novu 发起 POST 前记录一次尝试，供不确定窗口审计与对账。
+    /// 返回 false 表示该行已带业务终态：置为 suppressed 且不得触发（认领与终态套用之间的竞态在此收口）。</summary>
+    public async Task<bool> MarkTriggerAttemptAsync(string sendId, string worker, CancellationToken ct)
     {
         var entity = await FindClaimedAsync(sendId, worker, ct);
+        if (MessageBusinessState.IsTerminal(entity.BusinessState))
+        {
+            entity.Status = MessageOutboxState.Suppressed;
+            entity.NextRetryAt = null;
+            entity.LockedBy = null;
+            entity.LockedUntil = null;
+            entity.UpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync(ct);
+            return false;
+        }
+
         entity.TriggerAttempts++;
         entity.LastTriggerAt = DateTime.UtcNow;
         await _db.SaveChangesAsync(ct);
+        return true;
     }
 
     /// <summary>严格来源触发结果不确定：冻结为 uncertain，不再被认领，不自动重发同键请求。</summary>
@@ -286,11 +328,21 @@ WHERE ""send_id"" = {sendId}
         }
         else if (string.Equals(resolution, "CONFIRM_NOT_SENT", StringComparison.Ordinal))
         {
-            entity.Status = MessageOutboxState.Pending;
-            entity.RetryCount++;
-            entity.NovuTransactionId = null;
-            entity.NovuStatus = null;
-            entity.NextRetryAt = now;
+            // 行已带业务终态时不恢复重发：以原键补投只会复活已被撤回/过期/消费的待办。
+            if (MessageBusinessState.IsTerminal(entity.BusinessState))
+            {
+                entity.Status = MessageOutboxState.Suppressed;
+                entity.NovuStatus = "manual-confirm-not-send-suppressed";
+                entity.NextRetryAt = null;
+            }
+            else
+            {
+                entity.Status = MessageOutboxState.Pending;
+                entity.RetryCount++;
+                entity.NovuTransactionId = null;
+                entity.NovuStatus = null;
+                entity.NextRetryAt = now;
+            }
         }
         else
         {
@@ -303,6 +355,26 @@ WHERE ""send_id"" = {sendId}
         entity.UpdatedAt = now;
         await _db.SaveChangesAsync(ct);
         return entity;
+    }
+
+    /// <summary>Worker 可见性完成前的终态复查：终态行原子置 suppressed（受理审计保留）并返回 true。
+    /// 调用方随后应删除/收敛 Novu 侧消息，避免补投把已撤回/过期/消费的待办带回收件箱。</summary>
+    public async Task<bool> TrySuppressTerminalAsync(
+        string sendId,
+        string worker,
+        CancellationToken ct)
+    {
+        var entity = await FindClaimedAsync(sendId, worker, ct);
+        if (!MessageBusinessState.IsTerminal(entity.BusinessState)) return false;
+
+        var now = DateTime.UtcNow;
+        entity.Status = MessageOutboxState.Suppressed;
+        entity.NextRetryAt = null;
+        entity.LockedBy = null;
+        entity.LockedUntil = null;
+        entity.UpdatedAt = now;
+        await _db.SaveChangesAsync(ct);
+        return true;
     }
 
     public async Task MarkVisibleAsync(
@@ -434,21 +506,24 @@ WHERE ""send_id"" = {sendId}
         {
             RequestId = requestId,
             State = AggregateState(entities),
-            Recipients = entities.Select(MapRecipient).ToList(),
+            Recipients = entities.Select(x => MapRecipient(x)).ToList(),
             Skipped = skipped
         };
 
     private static SendRequestStatusResponse MapStatusResponse(
         string requestId,
-        IReadOnlyList<MessageOutboxEntity> entities)
+        IReadOnlyList<MessageOutboxEntity> entities,
+        bool includeTerminal)
         => new()
         {
             RequestId = requestId,
             State = AggregateState(entities),
-            Recipients = entities.Select(MapRecipient).ToList()
+            Recipients = entities.Select(x => MapRecipient(x, includeTerminal)).ToList()
         };
 
-    private static SendRecipientResponse MapRecipient(MessageOutboxEntity entity)
+    private static SendRecipientResponse MapRecipient(
+        MessageOutboxEntity entity,
+        bool includeTerminal = false)
         => new()
         {
             SendId = entity.SendId,
@@ -459,7 +534,11 @@ WHERE ""send_id"" = {sendId}
             Error = entity.LastError,
             TriggerAttempts = entity.TriggerAttempts,
             UncertainAt = entity.UncertainAt,
-            UncertainResolution = entity.UncertainResolution
+            UncertainResolution = entity.UncertainResolution,
+            BusinessState = includeTerminal ? entity.BusinessState : null,
+            BusinessVersion = includeTerminal ? entity.BusinessVersion : null,
+            TerminalAt = includeTerminal ? entity.TerminalAt : null,
+            TerminalReason = includeTerminal ? entity.TerminalReason : null
         };
 
     private static string AggregateState(IReadOnlyList<MessageOutboxEntity> entities)
@@ -467,6 +546,7 @@ WHERE ""send_id"" = {sendId}
         if (entities.All(x => x.Status == MessageOutboxState.Visible)) return MessageOutboxState.Visible;
         if (entities.Any(x => x.Status == MessageOutboxState.Uncertain)) return MessageOutboxState.Uncertain;
         if (entities.Any(x => x.Status == MessageOutboxState.Failed)) return MessageOutboxState.Failed;
+        if (entities.Any(x => x.Status == MessageOutboxState.Suppressed)) return MessageOutboxState.Suppressed;
         if (entities.Any(x => x.Status == MessageOutboxState.Accepted)) return MessageOutboxState.Accepted;
         return MessageOutboxState.Pending;
     }

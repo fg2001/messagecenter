@@ -103,7 +103,15 @@ public sealed class MessageOutboxWorker : BackgroundService
         {
             var payload = DeserializePayload(item);
             var novu = services.GetRequiredService<NovuClient>();
-            await store.MarkTriggerAttemptAsync(item.SendId, _worker, ct);
+            if (!await store.MarkTriggerAttemptAsync(item.SendId, _worker, ct))
+            {
+                // 受理与认领之间套用了业务终态（撤回/过期/消费先行到达）：抑制本次触发，保留受理审计。
+                _logger.LogInformation(
+                    "Message suppressed by business terminal state. SendId={SendId} BusinessState={BusinessState}",
+                    item.SendId,
+                    item.BusinessState);
+                return;
+            }
             var result = await novu.TriggerAsync(
                 item.WorkflowId,
                 item.SubscriberId,
@@ -184,6 +192,37 @@ public sealed class MessageOutboxWorker : BackgroundService
                     DateTime.UtcNow.AddSeconds(_options.OutboxVisibilityRetrySeconds),
                     "Novu accepted the trigger, but the in-app message is not visible yet.",
                     ct);
+                return;
+            }
+
+            // 可见性补投前的终态拦截（T-INT-01 §6）：终态在本行 accepted 与可见之间到达时，
+            // 不得把消息投进收件箱——按未送达处理：删除 Novu 侧消息并抑制本行。
+            if (await store.TrySuppressTerminalAsync(item.SendId, _worker, ct))
+            {
+                if (!string.IsNullOrEmpty(message.Id))
+                {
+                    try
+                    {
+                        await novu.DeleteMessageAsync(message.Id, ct);
+                        var projectionNow = services.GetRequiredService<MessageProjectionStore>();
+                        await projectionNow.RemoveAsync(item.SubscriberId, message.Id);
+                    }
+                    catch (Exception ex) when (!ct.IsCancellationRequested)
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Terminal message delete failed during visibility pass (row already suppressed). " +
+                            "SendId={SendId} MessageId={MessageId}",
+                            item.SendId,
+                            message.Id);
+                    }
+                }
+
+                _logger.LogInformation(
+                    "Message suppressed by business terminal state before visibility. " +
+                    "SendId={SendId} BusinessState={BusinessState}",
+                    item.SendId,
+                    item.BusinessState);
                 return;
             }
 

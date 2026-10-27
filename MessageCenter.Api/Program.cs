@@ -34,6 +34,7 @@ builder.Services.AddHttpClient<NovuClient>((sp, client) =>
 });
 // Polly extension point: add .AddPolicyHandler(...) to the NovuClient IHttpClientBuilder when retries are introduced.
 builder.Services.AddScoped<MessageOutboxStore>();
+builder.Services.AddScoped<MessageLifecycleStore>();
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 {
     var options = sp.GetRequiredService<IOptions<RedisOptions>>().Value;

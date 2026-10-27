@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using MessageCenter.Api.HttpClients;
+using MessageCenter.Api.HttpClients.Dtos;
 using MessageCenter.Api.Models;
 using MessageCenter.Api.Options;
 using MessageCenter.Api.Outbox;
@@ -18,27 +19,41 @@ public sealed class MessageCenterController : ControllerBase
     private static readonly HashSet<string> MessageViews =
         new(StringComparer.OrdinalIgnoreCase) { "all", "unread", "read" };
 
+    private static readonly HashSet<string> LifecycleActions =
+        new(StringComparer.Ordinal) { "CONSUME", "REVOKE", "EXPIRE" };
+
+    private const int LifecycleFeedPageSize = 100;
+
     private readonly NovuClient _novu;
     private readonly NovuOptions _options;
     private readonly SourceSystemOptions _sourceSystemOptions;
+    private readonly MessageWorkerOptions _workerOptions;
     private readonly MessageOutboxStore _outbox;
+    private readonly MessageLifecycleStore _lifecycle;
     private readonly MessageProjectionStore _projection;
     private readonly MessageWorkQueue _jobs;
+    private readonly ILogger<MessageCenterController> _logger;
 
     public MessageCenterController(
         NovuClient novu,
         IOptions<NovuOptions> options,
         IOptions<SourceSystemOptions> sourceSystemOptions,
+        IOptions<MessageWorkerOptions> workerOptions,
         MessageOutboxStore outbox,
+        MessageLifecycleStore lifecycle,
         MessageProjectionStore projection,
-        MessageWorkQueue jobs)
+        MessageWorkQueue jobs,
+        ILogger<MessageCenterController> logger)
     {
         _novu = novu;
         _options = options.Value;
         _sourceSystemOptions = sourceSystemOptions.Value;
+        _workerOptions = workerOptions.Value;
         _outbox = outbox;
+        _lifecycle = lifecycle;
         _projection = projection;
         _jobs = jobs;
+        _logger = logger;
     }
 
     [HttpPost("send")]
@@ -88,12 +103,16 @@ public sealed class MessageCenterController : ControllerBase
     [HttpGet("send/{requestId}")]
     public async Task<IActionResult> GetSendStatus(
         string requestId,
-        CancellationToken ct)
+        [FromQuery] string? include = null,
+        CancellationToken ct = default)
     {
         var sourceSystem = GetSourceSystem();
         if (sourceSystem.Result is not null) return sourceSystem.Result;
 
-        var response = await _outbox.GetRequestAsync(sourceSystem.Name!, requestId, ct);
+        // include=terminal：收件人条目附带业务状态（businessState/businessVersion/terminalAt/terminalReason）。
+        var includeTerminal = string.Equals(include, "terminal", StringComparison.OrdinalIgnoreCase);
+        var response = await _outbox.GetRequestAsync(
+            sourceSystem.Name!, requestId, ct, includeTerminal);
         return response is null ? NotFound() : Ok(response);
     }
 
@@ -151,6 +170,195 @@ public sealed class MessageCenterController : ControllerBase
 
         var response = await _outbox.GetRequestAsync(sourceSystem.Name!, requestId, ct);
         return Ok(response);
+    }
+
+    /// <summary>T-INT-05 生命周期操作（T-INT-01 §6）：CONSUME/REVOKE/EXPIRE 按原键作用于收件人条目。
+    /// 同 operationId 同载荷重放返回原结果；异载荷 409；businessVersion ≤ 当前 422；
+    /// REVOKE/EXPIRE 允许在 send 到达前按原键暂存（deferred），迟到的 send 受理即套用终态且不生成有效通知。</summary>
+    [HttpPost("send/{requestId}/recipients/{subscriberId}/lifecycle")]
+    public async Task<IActionResult> ApplyLifecycle(
+        string requestId,
+        string subscriberId,
+        [FromBody] LifecycleRequest? body,
+        CancellationToken ct)
+    {
+        var source = GetSourceSystem();
+        if (source.Result is not null) return source.Result;
+        var sourceSystem = source.Name!;
+
+        if (string.IsNullOrWhiteSpace(subscriberId))
+        {
+            return BadRequest(new { error = "subscriberId is required." });
+        }
+        if (body is null || string.IsNullOrWhiteSpace(body.OperationId) || body.OperationId.Length > 128)
+        {
+            return BadRequest(new
+            {
+                error = "operationId is required (max 128 characters)."
+            });
+        }
+        if (!LifecycleActions.Contains(body.Action))
+        {
+            return BadRequest(new
+            {
+                error = "action must be one of: CONSUME, REVOKE, EXPIRE."
+            });
+        }
+        if (body.BusinessVersion < 1)
+        {
+            return BadRequest(new { error = "businessVersion must be a positive integer." });
+        }
+        if (body.Reason?.Length > 2000)
+        {
+            return BadRequest(new { error = "reason must be at most 2000 characters." });
+        }
+
+        LifecycleApplyResult result;
+        try
+        {
+            result = await _lifecycle.ApplyAsync(
+                new LifecycleApplyInput(
+                    sourceSystem,
+                    requestId,
+                    subscriberId,
+                    body.OperationId,
+                    body.Action,
+                    body.BusinessVersion,
+                    body.Reason,
+                    body.OccurredAt),
+                ct);
+        }
+        catch (MessageLifecycleConflictException ex)
+        {
+            return Conflict(new { error = ex.Message, operationId = body.OperationId });
+        }
+        catch (MessageLifecycleNotFoundException ex)
+        {
+            return NotFound(new { error = ex.Message });
+        }
+        catch (MessageLifecycleVersionRejectException ex)
+        {
+            return UnprocessableEntity(new
+            {
+                error = ex.Message,
+                attemptedVersion = ex.AttemptedVersion,
+                currentVersion = ex.CurrentVersion
+            });
+        }
+
+        // Novu/收件箱收敛（尽力而为，不影响已生效的本地终态）：
+        // 已触发过的消息按动作删除（REVOKE/EXPIRE）或标记已读（CONSUME），并触发投影重建兜底。
+        if (result is { Replayed: false, ApplyStatus: MessageLifecycleApplyStatus.Applied })
+        {
+            await ConvergeExternalChannelsAsync(sourceSystem, requestId, subscriberId, ct);
+        }
+
+        return Accepted(new LifecycleResponse
+        {
+            OperationId = result.OperationId,
+            RequestId = result.RequestId,
+            SubscriberId = result.SubscriberId,
+            Action = result.Action,
+            BusinessVersion = result.BusinessVersion,
+            Status = result.Replayed ? "replayed" : result.ApplyStatus,
+            BusinessState = result.ResultBusinessState,
+            SendId = result.SendId,
+            OccurredAt = result.OccurredAt,
+            RecordedAt = result.RecordedAt
+        });
+    }
+
+    /// <summary>生命周期操作回读：同来源令牌按 requestId + operationId 查询操作记录。</summary>
+    [HttpGet("send/{requestId}/operations/{operationId}")]
+    public async Task<IActionResult> GetLifecycleOperation(
+        string requestId,
+        string operationId,
+        CancellationToken ct)
+    {
+        var source = GetSourceSystem();
+        if (source.Result is not null) return source.Result;
+
+        var operation = await _lifecycle.GetOperationAsync(
+            source.Name!, requestId, operationId, ct);
+        return operation is null
+            ? NotFound()
+            : Ok(new LifecycleOperationResponse
+            {
+                OperationId = operation.OperationId,
+                RequestId = operation.RequestId,
+                SubscriberId = operation.SubscriberId,
+                SendId = operation.SendId,
+                Action = operation.Action,
+                BusinessVersion = operation.BusinessVersion,
+                Reason = operation.Reason,
+                ApplyStatus = operation.ApplyStatus,
+                ResultBusinessState = operation.ResultBusinessState,
+                OccurredAt = operation.OccurredAt,
+                RecordedAt = operation.RecordedAt,
+                AppliedAt = operation.AppliedAt
+            });
+    }
+
+    /// <summary>终态作用后的外部渠道收敛：仅在消息已真实触发过（有回执事务或尝试记录）时执行。
+    /// 失败只记录告警——本地终态已生效，Novu 侧残留由 MC 页面/MICIP 旧链接核权兜底识别。</summary>
+    private async Task ConvergeExternalChannelsAsync(
+        string sourceSystem,
+        string requestId,
+        string subscriberId,
+        CancellationToken ct)
+    {
+        try
+        {
+            var row = await _outbox.FindRecipientAsync(sourceSystem, requestId, subscriberId, ct);
+            if (row is null || (row.NovuTransactionId is null && row.TriggerAttempts == 0))
+            {
+                return; // 从未向 Novu 触发（suppressed/failed），无外部可收敛对象。
+            }
+
+            var message = await FindNovuMessageAsync(row, ct);
+            if (message?.Id is not null)
+            {
+                if (row.BusinessState == MessageBusinessState.Consumed)
+                {
+                    await _novu.MarkAsAsync(subscriberId, message.Id, read: true, ct);
+                    await _projection.SetReadStateAsync(subscriberId, message.Id, true);
+                }
+                else
+                {
+                    await _novu.DeleteMessageAsync(message.Id, ct);
+                    await _projection.RemoveAsync(subscriberId, message.Id);
+                }
+            }
+
+            await _jobs.EnqueueRebuildAsync(subscriberId);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                ex,
+                "Lifecycle external convergence failed (terminal state already recorded). " +
+                "RequestId={RequestId} SubscriberId={SubscriberId}",
+                requestId,
+                subscriberId);
+        }
+    }
+
+    private async Task<NovuMessageItem?> FindNovuMessageAsync(
+        MessageOutboxEntity row,
+        CancellationToken ct)
+    {
+        for (var page = 0; page < _workerOptions.OutboxVisibilityPages; page++)
+        {
+            var feed = await _novu.GetFeedAsync(page, LifecycleFeedPageSize, row.SubscriberId, ct);
+            var message = feed.Data.FirstOrDefault(x =>
+                string.Equals(x.TransactionId, row.NovuTransactionId, StringComparison.Ordinal) ||
+                string.Equals(x.TransactionId, row.SendId, StringComparison.Ordinal) ||
+                string.Equals(x.Payload?.SendId, row.SendId, StringComparison.Ordinal));
+            if (message is not null) return message;
+            if (!feed.HasMore || feed.Data.Count == 0) break;
+        }
+
+        return null;
     }
 
     [HttpGet("my")]

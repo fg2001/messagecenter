@@ -133,6 +133,15 @@ public class NovuClient
         response.EnsureSuccessStatusCode();
     }
 
+    /// <summary>按 Novu messageId 删除 in_app 消息（撤回/过期的 Novu 侧收敛）。
+    /// 404 视为已收敛（此前已删除或从未可见），不视为错误。</summary>
+    public async Task DeleteMessageAsync(string messageId, CancellationToken ct = default)
+    {
+        var response = await _http.DeleteAsync($"/v1/messages/{Uri.EscapeDataString(messageId)}", ct);
+        if (response.StatusCode == HttpStatusCode.NotFound) return;
+        response.EnsureSuccessStatusCode();
+    }
+
     private class NovuEnvelope<T>
     {
         public T? Data { get; set; }
