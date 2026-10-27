@@ -27,6 +27,7 @@ var host = Host.CreateDefaultBuilder(args)
             options.UseDm(messageCenterConnectionString));
         services.AddScoped<MessageOutboxStore>();
         services.AddScoped<MessageTerminalSyncStore>();
+        services.AddScoped<MessageProjectionAuthority>();
         services.AddHttpClient<NovuClient>((sp, client) =>
         {
             var options = sp.GetRequiredService<IOptions<NovuOptions>>().Value;

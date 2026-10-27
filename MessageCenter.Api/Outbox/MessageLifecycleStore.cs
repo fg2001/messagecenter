@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using MessageCenter.Api.Data;
+using MessageCenter.Api.Services;
 using Microsoft.EntityFrameworkCore;
 
 namespace MessageCenter.Api.Outbox;
@@ -90,6 +91,8 @@ public sealed class MessageLifecycleStore
         }
 
         var operationHash = ComputeOperationHash(input);
+        var projection = new MessageProjectionAuthority(_db);
+        await projection.EnsureAsync(input.SubscriberId, ct);
         await using var transaction = await MessageRequestGuard.LockAsync(_db, input.SourceSystem, input.RequestId, ct);
         var existing = await _db.MessageLifecycleOperations.FirstOrDefaultAsync(
             x => x.SourceSystem == input.SourceSystem && x.OperationId == input.OperationId,
@@ -215,6 +218,7 @@ public sealed class MessageLifecycleStore
         var neverTriggered = await _db.MessageTerminalSync.AsNoTracking()
             .AnyAsync(x => x.SendId == row.SendId && x.NeverTriggered, ct);
         MessageTerminalSyncStore.Schedule(_db, row, now, neverTriggered);
+        await projection.BumpAsync(row.SubscriberId, ct);
         await _db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
         return new LifecycleApplyResult(

@@ -1,4 +1,5 @@
 using MessageCenter.Api.Outbox;
+using MessageCenter.Api.Services;
 using Microsoft.EntityFrameworkCore;
 
 namespace MessageCenter.Api.Data;
@@ -15,9 +16,16 @@ public sealed class MessageCenterDbContext : DbContext
         => Set<MessageLifecycleOperationEntity>();
     public DbSet<MessageRequestGuardEntity> MessageRequestGuards => Set<MessageRequestGuardEntity>();
     public DbSet<MessageTerminalSyncEntity> MessageTerminalSync => Set<MessageTerminalSyncEntity>();
+    public DbSet<MessageSubscriberVersionEntity> MessageSubscriberVersions => Set<MessageSubscriberVersionEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        var revision = modelBuilder.Entity<MessageSubscriberVersionEntity>();
+        revision.ToTable("message_subscriber_version");
+        revision.HasKey(x => x.SubscriberId);
+        revision.Property(x => x.SubscriberId).HasColumnName("subscriber_id").HasMaxLength(128);
+        revision.Property(x => x.Revision).HasColumnName("revision");
+
         var sync = modelBuilder.Entity<MessageTerminalSyncEntity>();
         sync.ToTable("message_terminal_sync");
         sync.HasKey(x => new { x.SendId, x.BusinessVersion });

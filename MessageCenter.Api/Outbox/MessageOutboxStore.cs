@@ -52,6 +52,9 @@ public sealed class MessageOutboxStore
         CancellationToken ct)
     {
         var requestHash = ComputeRequestHash(sourceSystem, request, triggers);
+        var projection = new MessageProjectionAuthority(_db);
+        foreach (var subscriber in triggers.Select(x => x.SubscriberId).Distinct())
+            await projection.EnsureAsync(subscriber, ct);
         await using var transaction = await MessageRequestGuard.LockAsync(_db, sourceSystem, request.RequestId, ct);
         var existing = await FindRequestAsync(sourceSystem, request.RequestId, ct);
         if (existing.Count > 0)
@@ -112,8 +115,12 @@ public sealed class MessageOutboxStore
             if (deferredMarkers.Count > 0)
             {
                 MessageLifecycleStore.ApplyDeferredMarkers(deferredMarkers, entities, now);
-                foreach (var row in entities.Where(x => MessageBusinessState.IsTerminal(x.BusinessState)))
+                foreach (var row in entities.Where(x => MessageBusinessState.IsTerminal(x.BusinessState))
+                             .OrderBy(x => x.SubscriberId, StringComparer.Ordinal))
+                {
                     MessageTerminalSyncStore.Schedule(_db, row, now, neverTriggered: true);
+                    await projection.BumpAsync(row.SubscriberId, ct);
+                }
                 await _db.SaveChangesAsync(ct);
             }
 

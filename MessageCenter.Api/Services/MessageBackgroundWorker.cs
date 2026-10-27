@@ -163,12 +163,6 @@ public sealed class MessageBackgroundWorker : BackgroundService
             }
             else
             {
-                if (item.Type == MessageWorkQueue.Rebuild)
-                {
-                    var store = services.GetRequiredService<MessageProjectionStore>();
-                    await store.AbandonRebuildAsync(item.SubscriberId, item.Id);
-                }
-
                 if (item.Type == MessageWorkQueue.ReadAll)
                 {
                     var current = await queue.GetReadAllStatusAsync(item.Id);
@@ -227,20 +221,24 @@ public sealed class MessageBackgroundWorker : BackgroundService
     {
         var novu = services.GetRequiredService<NovuClient>();
         var store = services.GetRequiredService<MessageProjectionStore>();
-        await store.BeginRebuildAsync(item.SubscriberId, item.Id);
-
-        for (var page = 0; ; page++)
+        // 每次尝试使用新代际，旧租约持有者不能向同一重试代际补写过时内容。
+        var generation = Guid.NewGuid().ToString("N");
+        await store.BeginRebuildAsync(item.SubscriberId, generation);
+        try
         {
-            var feed = await GetFeedWithRetryAsync(
-                novu,
-                page,
-                item.SubscriberId,
-                ct);
-            await store.UpsertRebuildAsync(item.SubscriberId, item.Id, feed.Data);
-            if (!feed.HasMore || feed.Data.Count == 0) break;
+            for (var page = 0; ; page++)
+            {
+                var feed = await GetFeedWithRetryAsync(novu, page, item.SubscriberId, ct);
+                await store.UpsertRebuildAsync(item.SubscriberId, generation, feed.Data);
+                if (!feed.HasMore || feed.Data.Count == 0) break;
+            }
+            await store.CompleteRebuildAsync(item.SubscriberId, generation);
         }
-
-        await store.CompleteRebuildAsync(item.SubscriberId, item.Id);
+        catch
+        {
+            await store.AbandonRebuildAsync(item.SubscriberId, generation);
+            throw;
+        }
     }
 
     private async Task SyncRecentAsync(

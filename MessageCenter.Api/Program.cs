@@ -36,6 +36,7 @@ builder.Services.AddHttpClient<NovuClient>((sp, client) =>
 builder.Services.AddScoped<MessageOutboxStore>();
 builder.Services.AddScoped<MessageLifecycleStore>();
 builder.Services.AddScoped<MessageTerminalSyncStore>();
+builder.Services.AddScoped<MessageProjectionAuthority>();
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 {
     var options = sp.GetRequiredService<IOptions<RedisOptions>>().Value;
