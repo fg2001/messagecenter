@@ -1,20 +1,36 @@
--- PR5: message lifecycle (CONSUME/REVOKE/EXPIRE) migration for existing DM8 deployments.
--- Idempotent columns/constraints are re-declared; safe to run on schemas already migrated.
+-- PR5：既有DM8生命周期升级；备份并停止全部API/Worker写入后，在PR4之后执行。
+-- 逐列补缺，匿名块以独占一行的/结束；用DIsql或支持匿名块的执行器，不得直接按分号拆分。
+-- DDL会提交；中断后保持写入暂停，完整重跑并核对约束后才能恢复服务。
 
-ALTER TABLE "message_send_outbox" ADD (
-    "business_state"      VARCHAR2(16) DEFAULT 'ACTIVE' NOT NULL,
-    "business_version"    NUMBER(19) DEFAULT 0 NOT NULL,
-    "terminal_at"         TIMESTAMP(6) NULL,
-    "terminal_reason"     VARCHAR2(2000) NULL
-);
+ALTER TABLE "message_send_outbox" ADD COLUMN IF NOT EXISTS "business_state" VARCHAR2(16) DEFAULT 'ACTIVE' NOT NULL;
+ALTER TABLE "message_send_outbox" ADD COLUMN IF NOT EXISTS "business_version" NUMBER(19) DEFAULT 0 NOT NULL;
+ALTER TABLE "message_send_outbox" ADD COLUMN IF NOT EXISTS "terminal_at" TIMESTAMP(6) NULL;
+ALTER TABLE "message_send_outbox" ADD COLUMN IF NOT EXISTS "terminal_reason" VARCHAR2(2000) NULL;
 
--- Widen the status check constraint to include 'suppressed' (accepted but never delivered).
-ALTER TABLE "message_send_outbox" DROP CONSTRAINT "ck_message_send_outbox_status";
-ALTER TABLE "message_send_outbox" ADD CONSTRAINT "ck_message_send_outbox_status"
-    CHECK ("status" IN ('pending', 'accepted', 'visible', 'failed', 'uncertain', 'suppressed'));
+DECLARE
+    existing_count INT;
+BEGIN
+    SELECT COUNT(*) INTO existing_count FROM ALL_CONSTRAINTS
+      WHERE OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+        AND TABLE_NAME = 'message_send_outbox' AND CONSTRAINT_NAME = 'ck_message_send_outbox_status';
+    IF existing_count > 0 THEN
+        EXECUTE IMMEDIATE 'ALTER TABLE "message_send_outbox" DROP CONSTRAINT "ck_message_send_outbox_status"';
+    END IF;
+    EXECUTE IMMEDIATE 'ALTER TABLE "message_send_outbox" ADD CONSTRAINT "ck_message_send_outbox_status" CHECK ("status" IN (''pending'', ''accepted'', ''visible'', ''failed'', ''uncertain'', ''suppressed''))';
+END;
+/
 
-ALTER TABLE "message_send_outbox" ADD CONSTRAINT "ck_message_send_outbox_business"
-    CHECK ("business_state" IN ('ACTIVE', 'CONSUMED', 'REVOKED', 'EXPIRED'));
+DECLARE
+    existing_count INT;
+BEGIN
+    SELECT COUNT(*) INTO existing_count FROM ALL_CONSTRAINTS
+      WHERE OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+        AND TABLE_NAME = 'message_send_outbox' AND CONSTRAINT_NAME = 'ck_message_send_outbox_business';
+    IF existing_count = 0 THEN
+        EXECUTE IMMEDIATE 'ALTER TABLE "message_send_outbox" ADD CONSTRAINT "ck_message_send_outbox_business" CHECK ("business_state" IN (''ACTIVE'', ''CONSUMED'', ''REVOKED'', ''EXPIRED''))';
+    END IF;
+END;
+/
 
 CREATE TABLE IF NOT EXISTS "message_lifecycle_operation" (
     "operation_id"          VARCHAR2(128) NOT NULL,
