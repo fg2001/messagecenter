@@ -27,11 +27,11 @@ public sealed class MessageCenterDbContext : DbContext
         entity.Property(x => x.SubscriberId).HasColumnName("subscriber_id").HasMaxLength(128).IsRequired();
         entity.Property(x => x.WorkflowId).HasColumnName("workflow_id").HasMaxLength(128).IsRequired();
         entity.Property(x => x.Payload).HasColumnName("payload").HasColumnType("CLOB").IsRequired();
-        entity.Property(x => x.Status).HasColumnName("status").HasMaxLength(16).IsRequired();
+        entity.Property(x => x.Status).HasColumnName("status").HasMaxLength(16).IsRequired().IsConcurrencyToken();
         entity.Property(x => x.RetryCount).HasColumnName("retry_count");
         entity.Property(x => x.NextRetryAt).HasColumnName("next_retry_at");
-        entity.Property(x => x.LockedBy).HasColumnName("locked_by").HasMaxLength(128);
-        entity.Property(x => x.LockedUntil).HasColumnName("locked_until");
+        entity.Property(x => x.LockedBy).HasColumnName("locked_by").HasMaxLength(128).IsConcurrencyToken();
+        entity.Property(x => x.LockedUntil).HasColumnName("locked_until").IsConcurrencyToken();
         entity.Property(x => x.NovuTransactionId).HasColumnName("novu_transaction_id").HasMaxLength(255);
         entity.Property(x => x.NovuStatus).HasColumnName("novu_status").HasMaxLength(64);
         entity.Property(x => x.Acknowledged).HasColumnName("acknowledged");
@@ -47,7 +47,7 @@ public sealed class MessageCenterDbContext : DbContext
         entity.Property(x => x.UncertainResolution).HasColumnName("uncertain_resolution").HasMaxLength(32);
         entity.Property(x => x.BusinessState).HasColumnName("business_state").HasMaxLength(16)
             .HasDefaultValue("ACTIVE");
-        entity.Property(x => x.BusinessVersion).HasColumnName("business_version").HasDefaultValue(0L);
+        entity.Property(x => x.BusinessVersion).HasColumnName("business_version").HasDefaultValue(0L).IsConcurrencyToken();
         entity.Property(x => x.TerminalAt).HasColumnName("terminal_at");
         entity.Property(x => x.TerminalReason).HasColumnName("terminal_reason").HasMaxLength(2000);
 

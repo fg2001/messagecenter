@@ -24,7 +24,7 @@ public sealed class MessageOutboxEntity
     public DateTime? VisibleAt { get; set; }
     public DateTime? FailedAt { get; set; }
 
-    /// <summary>触发尝试次数（每次真正 POST 前递增，含最终成功的一次）。</summary>
+    /// <summary>已登记触发许可次数；进程可能在POST前退出，不能当作网络调用或送达次数。</summary>
     public int TriggerAttempts { get; set; }
     public DateTime? LastTriggerAt { get; set; }
     /// <summary>进入 uncertain 的时间；触发结果不确定期间非空。</summary>

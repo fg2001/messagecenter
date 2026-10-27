@@ -154,6 +154,13 @@ public sealed class MessageOutboxWorker : BackgroundService
                 "Trigger receipt mismatch on strict source. SendId={SendId} frozen as uncertain.",
                 item.SendId);
         }
+        catch (Exception ex) when (
+            !ct.IsCancellationRequested && _novuOptions.IsStrictTriggerSource(item.SourceSystem))
+        {
+            // 包括成功响应解析/入账失败：可能已到达Novu，不能退回pending自动重发。
+            await store.MarkTriggerUncertainAsync(item.SendId, _worker, ex.Message, ct);
+            _logger.LogError(ex, "Strict trigger remains uncertain. SendId={SendId}", item.SendId);
+        }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             var retry = item.RetryCount + 1;

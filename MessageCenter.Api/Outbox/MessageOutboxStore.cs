@@ -4,8 +4,10 @@ using System.Text.Json;
 using MessageCenter.Api.Data;
 using MessageCenter.Api.HttpClients.Dtos;
 using MessageCenter.Api.Models;
+using MessageCenter.Api.Options;
 using MessageCenter.Api.Services;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 
 namespace MessageCenter.Api.Outbox;
 
@@ -34,10 +36,12 @@ public sealed class MessageOutboxStore
         new(JsonSerializerDefaults.Web);
 
     private readonly MessageCenterDbContext _db;
+    private readonly NovuOptions _novuOptions;
 
-    public MessageOutboxStore(MessageCenterDbContext db)
+    public MessageOutboxStore(MessageCenterDbContext db, IOptions<NovuOptions>? options = null)
     {
         _db = db;
+        _novuOptions = options?.Value ?? new NovuOptions();
     }
 
     public async Task<SendMessageResponse> EnqueueAsync(
@@ -246,13 +250,13 @@ WHERE ""send_id"" = {sendId}
         entity.LockedBy = null;
         entity.LockedUntil = null;
         entity.LastError = null;
-        // 成功受理即终结任何不确定窗口（例如此前一次 uncertain 后人工确认前恰好重试成功）。
+        // 匹配回执结束本次触发意图；过期owner不能跨人工对账回写。
         entity.UncertainAt = null;
         entity.UpdatedAt = now;
         await _db.SaveChangesAsync(ct);
     }
 
-    /// <summary>每次真正向 Novu 发起 POST 前记录一次尝试，供不确定窗口审计与对账。
+    /// <summary>POST前持久记录一次触发许可，供不确定窗口审计；次数不证明实际网络调用或送达。
     /// 返回 false 表示该行已带业务终态：置为 suppressed 且不得触发（认领与终态套用之间的竞态在此收口）。</summary>
     public async Task<bool> MarkTriggerAttemptAsync(string sendId, string worker, CancellationToken ct)
     {
@@ -268,8 +272,20 @@ WHERE ""send_id"" = {sendId}
             return false;
         }
 
+        if (_novuOptions.IsStrictTriggerSource(entity.SourceSystem) && entity.Status != MessageOutboxState.Pending)
+            throw new InvalidOperationException("A strict trigger intent already exists; reconcile the original attempt.");
         entity.TriggerAttempts++;
         entity.LastTriggerAt = DateTime.UtcNow;
+        if (_novuOptions.IsStrictTriggerSource(entity.SourceSystem))
+        {
+            // 先提交不可自动认领的意图，再离开数据库发POST；进程在任意点退出都不能自动重发。
+            entity.Status = MessageOutboxState.Uncertain;
+            entity.UncertainAt = entity.LastTriggerAt;
+            entity.UncertainResolution = null;
+            entity.NextRetryAt = null;
+            entity.LastError = "TRIGGER_UNCERTAIN:POST_INTENT_PERSISTED";
+            entity.UpdatedAt = entity.LastTriggerAt.Value;
+        }
         await _db.SaveChangesAsync(ct);
         return true;
     }
@@ -294,7 +310,7 @@ WHERE ""send_id"" = {sendId}
     }
 
     /// <summary>人工对账收敛 uncertain：CONFIRM_SENT 按已受理继续可见性投影；
-    /// CONFIRM_NOT_SENT 恢复 pending 并沿用原 transactionId 重发一次（Novu 幂等兜底去重）。</summary>
+    /// CONFIRM_NOT_SENT 仅在核实未发送后恢复 pending，沿用原键显式尝试一次；缓存到期不是未发送证明。</summary>
     public async Task<MessageOutboxEntity> ResolveTriggerUncertainAsync(
         string sourceSystem,
         string requestId,
@@ -312,7 +328,8 @@ WHERE ""send_id"" = {sendId}
         if (entity.Status != MessageOutboxState.Uncertain)
             throw new InvalidOperationException(
                 $"Send '{sendId}' is not in uncertain state (current: {entity.Status}).");
-        if (entity.LockedBy is not null)
+        if (entity.LockedBy is not null &&
+            (entity.LockedUntil is null || entity.LockedUntil > DateTime.UtcNow))
             throw new InvalidOperationException(
                 $"Send '{sendId}' is currently leased by worker '{entity.LockedBy}'.");
 
@@ -420,6 +437,12 @@ WHERE ""send_id"" = {sendId}
         CancellationToken ct)
     {
         var entity = await FindClaimedAsync(sendId, worker, ct);
+        if (_novuOptions.IsStrictTriggerSource(entity.SourceSystem) &&
+            entity.Status == MessageOutboxState.Uncertain)
+        {
+            await MarkTriggerUncertainAsync(sendId, worker, error, ct);
+            return;
+        }
         var now = DateTime.UtcNow;
         entity.RetryCount++;
         entity.LastError = Truncate(error);
@@ -449,11 +472,17 @@ WHERE ""send_id"" = {sendId}
         string sendId,
         string worker,
         CancellationToken ct)
-        => await _db.MessageOutbox.FirstOrDefaultAsync(
+    {
+        var entity = await _db.MessageOutbox.FirstOrDefaultAsync(
                x => x.SendId == sendId && x.LockedBy == worker,
                ct)
            ?? throw new InvalidOperationException(
                $"Outbox lease for send '{sendId}' is no longer owned by '{worker}'.");
+        if (_novuOptions.IsStrictTriggerSource(entity.SourceSystem) &&
+            (entity.LockedUntil is null || entity.LockedUntil <= DateTime.UtcNow))
+            throw new InvalidOperationException("The strict trigger lease has expired; reconcile the original attempt.");
+        return entity;
+    }
 
     private Task<List<MessageOutboxEntity>> FindRequestAsync(
         string sourceSystem,

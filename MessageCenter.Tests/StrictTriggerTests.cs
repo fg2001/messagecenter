@@ -8,6 +8,8 @@ using MessageCenter.Api.Outbox;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging.Abstractions;
+using System.Reflection;
 using Xunit;
 
 namespace MessageCenter.Tests;
@@ -88,12 +90,75 @@ public sealed class StrictTriggerTests
     [Fact]
     public async Task MarkTriggerAttempt_increments_attempt_counter()
     {
-        await using var fx1 = await SeedClaimedRow("micip"); var store = fx1.NewStore();
+        await using var fx1 = await SeedClaimedRow("cooper"); var store = fx1.NewStore();
         await store.MarkTriggerAttemptAsync("send-1", "w1", default);
         await store.MarkTriggerAttemptAsync("send-1", "w1", default);
         var row = await fx1.NewDb().MessageOutbox.AsNoTracking().SingleAsync();
         Assert.Equal(2, row.TriggerAttempts);
         Assert.NotNull(row.LastTriggerAt);
+    }
+
+    [Fact]
+    public async Task Strict_attempt_persists_uncertain_before_http_and_survives_new_scope()
+    {
+        await using var fx = await SeedClaimedRow("micip");
+        Assert.True(await fx.NewStore().MarkTriggerAttemptAsync("send-1", "w1", default));
+        var recovered = await fx.NewDb().MessageOutbox.AsNoTracking().SingleAsync();
+        Assert.Equal(MessageOutboxState.Uncertain, recovered.Status);
+        Assert.NotNull(recovered.UncertainAt);
+        Assert.Null(recovered.NextRetryAt);
+        Assert.Equal("w1", recovered.LockedBy);
+        Assert.Equal(1, recovered.TriggerAttempts);
+    }
+
+    [Fact]
+    public async Task Strict_attempt_cannot_issue_a_second_post_permit()
+    {
+        await using var fx = await SeedClaimedRow("micip");
+        var store = fx.NewStore();
+        await store.MarkTriggerAttemptAsync("send-1", "w1", default);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            store.MarkTriggerAttemptAsync("send-1", "w1", default));
+    }
+
+    [Fact]
+    public async Task Expired_uncertain_lease_can_be_reconciled_but_late_worker_cannot_complete()
+    {
+        await using var fx = await SeedClaimedRow("micip");
+        var db = fx.NewDb();
+        var row = await db.MessageOutbox.SingleAsync();
+        row.Status = MessageOutboxState.Uncertain;
+        row.LockedUntil = DateTime.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        var resolved = await fx.NewStore().ResolveTriggerUncertainAsync(
+            "micip", "req-1", "send-1", "CONFIRM_NOT_SENT", default);
+        Assert.Equal(MessageOutboxState.Pending, resolved.Status);
+        Assert.Null(resolved.LockedBy);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            fx.NewStore().MarkTriggerAttemptAsync("send-1", "w1", default));
+    }
+
+    [Fact]
+    public async Task Worker_invalid_acknowledgement_does_not_restore_automatic_retry()
+    {
+        var handler = new UncertainHandler(() => Json(new { data = new {
+            acknowledged = false, status = "rejected", transactionId = "send-1" } }));
+        await using var fx = await SeedClaimedRow("micip", handler);
+        var policy = new NovuOptions(); policy.StrictTriggerSources.Add("micip");
+        using var worker = new MessageOutboxWorker(fx.Provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new MessageWorkerOptions()), Options.Create(policy), NullLogger<MessageOutboxWorker>.Instance);
+        var workerId = (string)typeof(MessageOutboxWorker).GetField("_worker", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(worker)!;
+        var db = fx.NewDb(); var row = await db.MessageOutbox.SingleAsync(); row.LockedBy = workerId;
+        await db.SaveChangesAsync();
+        var claimed = new ClaimedMessageOutboxItem("send-1", "179070", "micip-test-inapp", "{}",
+            MessageOutboxState.Pending, MessageBusinessState.Active, 0, null, "micip");
+        var task = (Task)typeof(MessageOutboxWorker).GetMethod("SendAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(worker, new object[] { claimed, fx.Provider, fx.NewStore(), CancellationToken.None })!;
+        await task;
+        var after = await fx.NewDb().MessageOutbox.AsNoTracking().SingleAsync();
+        Assert.Equal(MessageOutboxState.Uncertain, after.Status);
+        Assert.Null(after.NextRetryAt);
+        Assert.Equal(0, after.RetryCount);
     }
 
     // ---- 人工对账收敛 ----
@@ -174,12 +239,14 @@ public sealed class StrictTriggerTests
     private sealed class StoreFixture : IAsyncDisposable
     {
         public readonly ServiceProvider Provider;
-        public StoreFixture()
+        public StoreFixture(HttpMessageHandler? handler = null)
         {
             // 库名在 lambda 外求值一次：同一 fixture 的所有 scope 共享同一 InMemory 库，
             // 模拟"Worker 操作 scope / 状态查询 scope"跨作用积可见（与生产 DM8 行为一致）。
             var databaseName = "strict-" + Guid.NewGuid();
             var services = new ServiceCollection();
+            services.Configure<NovuOptions>(o => o.StrictTriggerSources.Add("micip"));
+            if (handler is not null) services.AddSingleton(Client(handler));
             services.AddDbContext<MessageCenterDbContext>(o =>
                 o.UseInMemoryDatabase(databaseName));
             services.AddTransient<MessageOutboxStore>();
@@ -209,9 +276,9 @@ public sealed class StrictTriggerTests
         }
     }
 
-    private static async Task<StoreFixture> SeedClaimedRow(string sourceSystem)
+    private static async Task<StoreFixture> SeedClaimedRow(string sourceSystem, HttpMessageHandler? handler = null)
     {
-        var fixture = new StoreFixture();
+        var fixture = new StoreFixture(handler);
         var db = fixture.NewDb();
         db.MessageOutbox.Add(new MessageOutboxEntity
         {

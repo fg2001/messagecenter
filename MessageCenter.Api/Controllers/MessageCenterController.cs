@@ -7,6 +7,7 @@ using MessageCenter.Api.Outbox;
 using MessageCenter.Api.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
 namespace MessageCenter.Api.Controllers;
@@ -167,6 +168,11 @@ public sealed class MessageCenterController : ControllerBase
         {
             return Conflict(new { error = ex.Message });
         }
+        catch (DbUpdateConcurrencyException)
+        {
+            return StatusCode(StatusCodes.Status503ServiceUnavailable,
+                new { code = "MESSAGE_CONCURRENT_UPDATE", error = "State changed; retry reconciliation with the original request." });
+        }
 
         var response = await _outbox.GetRequestAsync(sourceSystem.Name!, requestId, ct);
         return Ok(response);
@@ -244,6 +250,11 @@ public sealed class MessageCenterController : ControllerBase
                 attemptedVersion = ex.AttemptedVersion,
                 currentVersion = ex.CurrentVersion
             });
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            return StatusCode(StatusCodes.Status503ServiceUnavailable,
+                new { code = "MESSAGE_CONCURRENT_UPDATE", error = "State changed; retry the original lifecycle operation." });
         }
 
         // Novu/收件箱收敛（尽力而为，不影响已生效的本地终态）：
