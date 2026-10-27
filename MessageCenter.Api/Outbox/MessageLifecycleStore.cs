@@ -90,6 +90,7 @@ public sealed class MessageLifecycleStore
         }
 
         var operationHash = ComputeOperationHash(input);
+        await using var transaction = await MessageRequestGuard.LockAsync(_db, input.SourceSystem, input.RequestId, ct);
         var existing = await _db.MessageLifecycleOperations.FirstOrDefaultAsync(
             x => x.SourceSystem == input.SourceSystem && x.OperationId == input.OperationId,
             ct);
@@ -130,6 +131,14 @@ public sealed class MessageLifecycleStore
                 throw new MessageLifecycleNotFoundException(input.RequestId, input.SubscriberId);
             }
 
+            var version = await _db.MessageLifecycleOperations
+                .Where(x => x.SourceSystem == input.SourceSystem && x.RequestId == input.RequestId
+                    && x.SubscriberId == input.SubscriberId)
+                .Select(x => (long?)x.BusinessVersion).MaxAsync(ct);
+            if (version.HasValue && input.BusinessVersion <= version.Value)
+                throw new MessageLifecycleVersionRejectException(
+                    input.RequestId, input.SubscriberId, input.BusinessVersion, version.Value);
+
             var deferred = new MessageLifecycleOperationEntity
             {
                 OperationId = input.OperationId,
@@ -148,6 +157,7 @@ public sealed class MessageLifecycleStore
             };
             _db.MessageLifecycleOperations.Add(deferred);
             await _db.SaveChangesAsync(ct);
+            await transaction.CommitAsync(ct);
             return new LifecycleApplyResult(
                 deferred.OperationId,
                 deferred.RequestId,
@@ -203,6 +213,7 @@ public sealed class MessageLifecycleStore
         }
 
         await _db.SaveChangesAsync(ct);
+        await transaction.CommitAsync(ct);
         return new LifecycleApplyResult(
             operation.OperationId,
             operation.RequestId,

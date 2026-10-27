@@ -13,9 +13,17 @@ public sealed class MessageCenterDbContext : DbContext
     public DbSet<MessageOutboxEntity> MessageOutbox => Set<MessageOutboxEntity>();
     public DbSet<MessageLifecycleOperationEntity> MessageLifecycleOperations
         => Set<MessageLifecycleOperationEntity>();
+    public DbSet<MessageRequestGuardEntity> MessageRequestGuards => Set<MessageRequestGuardEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        var guard = modelBuilder.Entity<MessageRequestGuardEntity>();
+        guard.ToTable("message_request_guard");
+        guard.HasKey(x => x.RequestKey);
+        guard.Property(x => x.RequestKey).HasColumnName("request_key").HasMaxLength(64);
+        guard.Property(x => x.SourceSystem).HasColumnName("source_system").HasMaxLength(128).IsRequired();
+        guard.Property(x => x.RequestId).HasColumnName("request_id").HasMaxLength(128).IsRequired();
+
         var entity = modelBuilder.Entity<MessageOutboxEntity>();
         entity.ToTable("message_send_outbox");
         entity.HasKey(x => x.SendId);

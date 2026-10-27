@@ -317,3 +317,11 @@ dotnet publish .\MessageCenter.Worker\MessageCenter.Worker.csproj `
 触发客户端要求成功 HTTP 响应中的 `data.transactionId` 与本次发送的 `sendId` 精确一致（区分大小写，不裁剪空白）。缺失、空值或不匹配均抛出固定错误 `Novu trigger transaction mismatch.`，不把其他事务的回执写成本事务 accepted。Worker 继续使用既有失败路径、原 Outbox 行、工作流、载荷和原键；不新建请求、不返还 MICIP 额度。错误日志不包含对端返回的错误事务 ID。
 
 此检查只证明回执关联，不证明送达、已读或业务处理，也不能证明异常响应对应的原请求从未受理。现有 MC 自动原键重试仍依赖 Novu 幂等保留窗口；配置和实际版本须单独核验，窗口过期、截止执行、跨日和 UNKNOWN 结算不由本补丁保证。`AcceptedAt` 是本地收到成功回执的观察时间，不能代替真实平台受理日；MC 202 和查询404均不作最终送达/未发送证明。无请求字段、表、依赖或部署配置变更。
+
+## 生命周期与原请求并发（本地候选补丁）
+
+在PR4/5/6草案之上，PR7新增持久原请求锁表message_request_guard。已有PR5结构先执行scripts/message-center-outbox-pr7-dm.sql，再联合更新全部MC API与Worker实例；全新环境使用当前完整bootstrap。锁作用于所有来源的发送/生命周期受理；不能只给某个启用严格触发的实例迁移，也不能在仍有旧API实例处理生命周期时宣称并发保证生效。
+
+发送与CONSUME/REVOKE/EXPIRE按精确sourceSystem+requestId共用数据库行锁，直到受理/终态事务提交。即使消息行还不存在，撤回标记与迟到send也不会交错留下有效发送；相同来源/请求的收件人共享串行化，其他原键不共用锁。锁记录保留，不按请求结束删除；备份与回退须保留原请求、终态历史和锁表，不通过清表或重置版本回退。缺行终止标记也拒绝相等/更低businessVersion；同operationId重放和CONSUME缺行404语义不变。
+
+严格来源仍按PR6在POST前持久uncertain，只有确切未发送证明才可原键人工恢复；有限缓存不是永久去重保证。PR7不实现外部Novu/收件箱终态的持久重试或页面显示，不能据此宣告整条生命周期完成。当前只有本地候选实现和隔离验证，部署与联调仍待评审及具体授权。

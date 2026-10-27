@@ -133,6 +133,27 @@ public sealed class MessageLifecycleTests
         Assert.Equal("179070", op.SubscriberId);
     }
 
+    [Theory]
+    [InlineData(2)]
+    [InlineData(1)]
+    public async Task Deferred_marker_rejects_equal_or_lower_version_without_message_row(long version)
+    {
+        await using var fx = new StoreFixture();
+        await fx.NewLifecycleStore().ApplyAsync(Input(operationId: "op-high", action: "REVOKE", version: 2), default);
+        await Assert.ThrowsAsync<MessageLifecycleVersionRejectException>(() =>
+            fx.NewLifecycleStore().ApplyAsync(Input(operationId: "op-late", action: "EXPIRE", version: version), default));
+        Assert.Equal(1, await fx.NewDb().MessageLifecycleOperations.CountAsync());
+    }
+
+    [Fact]
+    public async Task Consume_missing_row_remains_not_found_even_with_existing_marker()
+    {
+        await using var fx = new StoreFixture();
+        await fx.NewLifecycleStore().ApplyAsync(Input(operationId: "op-high", action: "REVOKE", version: 2), default);
+        await Assert.ThrowsAsync<MessageLifecycleNotFoundException>(() =>
+            fx.NewLifecycleStore().ApplyAsync(Input(operationId: "op-consume", action: "CONSUME", version: 1), default));
+    }
+
     [Fact]
     public async Task Deferred_marker_suppresses_late_send_and_is_never_claimed()
     {

@@ -52,6 +52,7 @@ public sealed class MessageOutboxStore
         CancellationToken ct)
     {
         var requestHash = ComputeRequestHash(sourceSystem, request, triggers);
+        await using var transaction = await MessageRequestGuard.LockAsync(_db, sourceSystem, request.RequestId, ct);
         var existing = await FindRequestAsync(sourceSystem, request.RequestId, ct);
         if (existing.Count > 0)
         {
@@ -96,7 +97,6 @@ public sealed class MessageOutboxStore
             };
         }).ToList();
 
-        await using var transaction = await _db.Database.BeginTransactionAsync(ct);
         try
         {
             _db.MessageOutbox.AddRange(entities);
