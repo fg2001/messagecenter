@@ -14,9 +14,27 @@ public sealed class MessageCenterDbContext : DbContext
     public DbSet<MessageLifecycleOperationEntity> MessageLifecycleOperations
         => Set<MessageLifecycleOperationEntity>();
     public DbSet<MessageRequestGuardEntity> MessageRequestGuards => Set<MessageRequestGuardEntity>();
+    public DbSet<MessageTerminalSyncEntity> MessageTerminalSync => Set<MessageTerminalSyncEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        var sync = modelBuilder.Entity<MessageTerminalSyncEntity>();
+        sync.ToTable("message_terminal_sync");
+        sync.HasKey(x => new { x.SendId, x.BusinessVersion });
+        sync.Property(x => x.SendId).HasColumnName("send_id").HasMaxLength(64);
+        sync.Property(x => x.BusinessVersion).HasColumnName("business_version");
+        sync.Property(x => x.State).HasColumnName("state").HasMaxLength(16);
+        sync.Property(x => x.Attempts).HasColumnName("attempts");
+        sync.Property(x => x.NextAttemptAt).HasColumnName("next_attempt_at");
+        sync.Property(x => x.LockedBy).HasColumnName("locked_by").HasMaxLength(128);
+        sync.Property(x => x.LockedUntil).HasColumnName("locked_until");
+        sync.Property(x => x.LastError).HasColumnName("last_error").HasMaxLength(128);
+        sync.Property(x => x.LastConfirmedAt).HasColumnName("last_confirmed_at");
+        sync.Property(x => x.MessageIds).HasColumnName("message_ids").HasColumnType("CLOB");
+        sync.Property(x => x.NextPage).HasColumnName("next_page");
+        sync.Property(x => x.NeverTriggered).HasColumnName("never_triggered");
+        sync.HasIndex(x => new { x.State, x.NextAttemptAt }).HasDatabaseName("ix_msg_terminal_sync_due");
+
         var guard = modelBuilder.Entity<MessageRequestGuardEntity>();
         guard.ToTable("message_request_guard");
         guard.HasKey(x => x.RequestKey);

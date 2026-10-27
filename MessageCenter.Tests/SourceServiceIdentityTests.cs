@@ -222,7 +222,7 @@ public sealed class SourceServiceIdentityTests
 
     private static MessageCenterController Controller(ClaimsPrincipal user, SourceSystemOptions options)
         => new(null!, Options.Create(new NovuOptions()), Options.Create(options),
-            Options.Create(new MessageWorkerOptions()), null!, null!, null!, null!, null!)
+            null!, null!, null!, null!)
         {
             ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext { User = user } }
         };

@@ -1,6 +1,5 @@
 using System.Security.Claims;
 using MessageCenter.Api.HttpClients;
-using MessageCenter.Api.HttpClients.Dtos;
 using MessageCenter.Api.Models;
 using MessageCenter.Api.Options;
 using MessageCenter.Api.Outbox;
@@ -23,38 +22,30 @@ public sealed class MessageCenterController : ControllerBase
     private static readonly HashSet<string> LifecycleActions =
         new(StringComparer.Ordinal) { "CONSUME", "REVOKE", "EXPIRE" };
 
-    private const int LifecycleFeedPageSize = 100;
-
     private readonly NovuClient _novu;
     private readonly NovuOptions _options;
     private readonly SourceSystemOptions _sourceSystemOptions;
-    private readonly MessageWorkerOptions _workerOptions;
     private readonly MessageOutboxStore _outbox;
     private readonly MessageLifecycleStore _lifecycle;
     private readonly MessageProjectionStore _projection;
     private readonly MessageWorkQueue _jobs;
-    private readonly ILogger<MessageCenterController> _logger;
 
     public MessageCenterController(
         NovuClient novu,
         IOptions<NovuOptions> options,
         IOptions<SourceSystemOptions> sourceSystemOptions,
-        IOptions<MessageWorkerOptions> workerOptions,
         MessageOutboxStore outbox,
         MessageLifecycleStore lifecycle,
         MessageProjectionStore projection,
-        MessageWorkQueue jobs,
-        ILogger<MessageCenterController> logger)
+        MessageWorkQueue jobs)
     {
         _novu = novu;
         _options = options.Value;
         _sourceSystemOptions = sourceSystemOptions.Value;
-        _workerOptions = workerOptions.Value;
         _outbox = outbox;
         _lifecycle = lifecycle;
         _projection = projection;
         _jobs = jobs;
-        _logger = logger;
     }
 
     [HttpPost("send")]
@@ -257,12 +248,9 @@ public sealed class MessageCenterController : ControllerBase
                 new { code = "MESSAGE_CONCURRENT_UPDATE", error = "State changed; retry the original lifecycle operation." });
         }
 
-        // Novu/收件箱收敛（尽力而为，不影响已生效的本地终态）：
-        // 已触发过的消息按动作删除（REVOKE/EXPIRE）或标记已读（CONSUME），并触发投影重建兜底。
-        if (result is { Replayed: false, ApplyStatus: MessageLifecycleApplyStatus.Applied })
-        {
-            await ConvergeExternalChannelsAsync(sourceSystem, requestId, subscriberId, ct);
-        }
+        // 终态与持久任务已共同提交；请求不等待外部渠道，失败由Worker按原键继续补偿。
+        var external = result.SendId is null ? null
+            : await _lifecycle.GetExternalSyncAsync(result.SendId, result.BusinessVersion, ct);
 
         return Accepted(new LifecycleResponse
         {
@@ -275,7 +263,8 @@ public sealed class MessageCenterController : ControllerBase
             BusinessState = result.ResultBusinessState,
             SendId = result.SendId,
             OccurredAt = result.OccurredAt,
-            RecordedAt = result.RecordedAt
+            RecordedAt = result.RecordedAt,
+            ExternalState = ExternalState(result.ApplyStatus, result.SendId, external)
         });
     }
 
@@ -291,6 +280,8 @@ public sealed class MessageCenterController : ControllerBase
 
         var operation = await _lifecycle.GetOperationAsync(
             source.Name!, requestId, operationId, ct);
+        var external = operation?.SendId is null ? null
+            : await _lifecycle.GetExternalSyncAsync(operation.SendId, operation.BusinessVersion, ct);
         return operation is null
             ? NotFound()
             : Ok(new LifecycleOperationResponse
@@ -306,70 +297,11 @@ public sealed class MessageCenterController : ControllerBase
                 ResultBusinessState = operation.ResultBusinessState,
                 OccurredAt = operation.OccurredAt,
                 RecordedAt = operation.RecordedAt,
-                AppliedAt = operation.AppliedAt
+                AppliedAt = operation.AppliedAt,
+                ExternalState = ExternalState(operation.ApplyStatus, operation.SendId, external),
+                LastExternalConfirmedAt = external?.LastConfirmedAt,
+                ExternalError = external?.LastError
             });
-    }
-
-    /// <summary>终态作用后的外部渠道收敛：仅在消息已真实触发过（有回执事务或尝试记录）时执行。
-    /// 失败只记录告警——本地终态已生效，Novu 侧残留由 MC 页面/MICIP 旧链接核权兜底识别。</summary>
-    private async Task ConvergeExternalChannelsAsync(
-        string sourceSystem,
-        string requestId,
-        string subscriberId,
-        CancellationToken ct)
-    {
-        try
-        {
-            var row = await _outbox.FindRecipientAsync(sourceSystem, requestId, subscriberId, ct);
-            if (row is null || (row.NovuTransactionId is null && row.TriggerAttempts == 0))
-            {
-                return; // 从未向 Novu 触发（suppressed/failed），无外部可收敛对象。
-            }
-
-            var message = await FindNovuMessageAsync(row, ct);
-            if (message?.Id is not null)
-            {
-                if (row.BusinessState == MessageBusinessState.Consumed)
-                {
-                    await _novu.MarkAsAsync(subscriberId, message.Id, read: true, ct);
-                    await _projection.SetReadStateAsync(subscriberId, message.Id, true);
-                }
-                else
-                {
-                    await _novu.DeleteMessageAsync(message.Id, ct);
-                    await _projection.RemoveAsync(subscriberId, message.Id);
-                }
-            }
-
-            await _jobs.EnqueueRebuildAsync(subscriberId);
-        }
-        catch (Exception ex) when (!ct.IsCancellationRequested)
-        {
-            _logger.LogWarning(
-                ex,
-                "Lifecycle external convergence failed (terminal state already recorded). " +
-                "RequestId={RequestId} SubscriberId={SubscriberId}",
-                requestId,
-                subscriberId);
-        }
-    }
-
-    private async Task<NovuMessageItem?> FindNovuMessageAsync(
-        MessageOutboxEntity row,
-        CancellationToken ct)
-    {
-        for (var page = 0; page < _workerOptions.OutboxVisibilityPages; page++)
-        {
-            var feed = await _novu.GetFeedAsync(page, LifecycleFeedPageSize, row.SubscriberId, ct);
-            var message = feed.Data.FirstOrDefault(x =>
-                string.Equals(x.TransactionId, row.NovuTransactionId, StringComparison.Ordinal) ||
-                string.Equals(x.TransactionId, row.SendId, StringComparison.Ordinal) ||
-                string.Equals(x.Payload?.SendId, row.SendId, StringComparison.Ordinal));
-            if (message is not null) return message;
-            if (!feed.HasMore || feed.Data.Count == 0) break;
-        }
-
-        return null;
     }
 
     [HttpGet("my")]
@@ -499,6 +431,10 @@ public sealed class MessageCenterController : ControllerBase
         var username = User.FindFirstValue("preferred_username");
         return string.IsNullOrWhiteSpace(username) ? null : username;
     }
+
+    private static string ExternalState(string applyStatus, string? sendId, MessageTerminalSyncEntity? sync)
+        => applyStatus == MessageLifecycleApplyStatus.Superseded ? "superseded"
+            : sync?.State ?? (sendId is null ? "waiting-for-send" : "not-tracked");
 
     private (string? Name, IActionResult? Result) GetSourceSystem()
     {

@@ -26,6 +26,7 @@ var host = Host.CreateDefaultBuilder(args)
         services.AddDbContext<MessageCenterDbContext>(options =>
             options.UseDm(messageCenterConnectionString));
         services.AddScoped<MessageOutboxStore>();
+        services.AddScoped<MessageTerminalSyncStore>();
         services.AddHttpClient<NovuClient>((sp, client) =>
         {
             var options = sp.GetRequiredService<IOptions<NovuOptions>>().Value;
@@ -43,6 +44,7 @@ var host = Host.CreateDefaultBuilder(args)
         services.AddSingleton<MessageWorkQueue>();
         services.AddHostedService<MessageBackgroundWorker>();
         services.AddHostedService<MessageOutboxWorker>();
+        services.AddHostedService<MessageTerminalSyncWorker>();
     })
     .Build();
 

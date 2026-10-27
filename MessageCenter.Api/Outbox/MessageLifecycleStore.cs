@@ -212,6 +212,9 @@ public sealed class MessageLifecycleStore
             row.LockedUntil = null;
         }
 
+        var neverTriggered = await _db.MessageTerminalSync.AsNoTracking()
+            .AnyAsync(x => x.SendId == row.SendId && x.NeverTriggered, ct);
+        MessageTerminalSyncStore.Schedule(_db, row, now, neverTriggered);
         await _db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
         return new LifecycleApplyResult(
@@ -238,6 +241,10 @@ public sealed class MessageLifecycleStore
                  && x.RequestId == requestId
                  && x.OperationId == operationId,
             ct);
+
+    public Task<MessageTerminalSyncEntity?> GetExternalSyncAsync(string sendId, long version, CancellationToken ct)
+        => _db.MessageTerminalSync.AsNoTracking().FirstOrDefaultAsync(
+            x => x.SendId == sendId && x.BusinessVersion == version, ct);
 
     /// <summary>迟到的 send 受理后套用暂存终止标记：取该收件人最高版本标记生效，
     /// 低版本标记置 superseded（保留审计）；命中行立即置终态并抑制发送。</summary>

@@ -325,3 +325,17 @@ dotnet publish .\MessageCenter.Worker\MessageCenter.Worker.csproj `
 发送与CONSUME/REVOKE/EXPIRE按精确sourceSystem+requestId共用数据库行锁，直到受理/终态事务提交。即使消息行还不存在，撤回标记与迟到send也不会交错留下有效发送；相同来源/请求的收件人共享串行化，其他原键不共用锁。锁记录保留，不按请求结束删除；备份与回退须保留原请求、终态历史和锁表，不通过清表或重置版本回退。缺行终止标记也拒绝相等/更低businessVersion；同operationId重放和CONSUME缺行404语义不变。
 
 严格来源仍按PR6在POST前持久uncertain，只有确切未发送证明才可原键人工恢复；有限缓存不是永久去重保证。PR7不实现外部Novu/收件箱终态的持久重试或页面显示，不能据此宣告整条生命周期完成。当前只有本地候选实现和隔离验证，部署与联调仍待评审及具体授权。
+# 终态持久补偿（PR8，本地候选）
+
+消费、撤回或过期与 `message_terminal_sync` 原sendId/业务版本任务共同提交，API不等待Novu或Redis。
+独立Worker从DM8认领，按原收件人/事务键查找消息，删除前保存目标ID；Novu删除成功但投影失败后，换进程仍可使用原ID继续清理。
+CONSUME标记Novu已读，REVOKE/EXPIRE删除目标；三类终态均清除当前及重建中的Redis投影。不会再次调用trigger。
+
+先执行 `scripts/message-center-outbox-pr8-dm.sql`，再统一升级API和Worker（依赖PR4～PR7）。脚本可重复执行，按原版本补齐历史终态任务，不重置已有任务/租约，也不改写原消息与生命周期记录。
+保留补偿表、原消息、原键锁及终态审计；不能通过删表或退回旧API来宣称安全回退。
+
+接口原 `applied/deferred/replayed` 仍表示本地操作状态。新增 `externalState` 区分 `pending`（未确认或故障）、`watching`（已清理当前已知目标，仍巡检迟到消息）、`not-required`（已证明新send受理即抑制，从未触发）、`superseded`、`waiting-for-send` 及 `not-tracked`（历史操作无对应任务）。操作回读另附 `lastExternalConfirmedAt/externalError`。不能把202、一次空feed、历史触发计数为0或一次清理成功当作永久收敛。
+
+每轮使用既有Outbox批量、租约、可见性页数和重试选项；保存分页位置，下一轮继续深分页。已清理任务使用ActiveSyncIntervalSeconds继续巡检，发现迟到目标后仍按原键补偿。租约过期owner不能登记目标或回写结果。历史任务持续巡检的容量、保留期、监控告警和实际同步时限仍须D6确定；没有擅自设定“查不到即成功”的截止时间。
+
+本地验证含真实隔离DM8、进程间恢复和受控HTTP/Redis故障夹具；不替代真实Redis/Novu与页面验收。MC页面/全量投影重建仍须识别持久终态，当前重建可能在下一轮补偿前短暂重新导入旧消息；T-INT-05尚未整体完成。未推送、部署或真实发送。

@@ -62,6 +62,8 @@ public sealed class LifecycleRequest
 
 public sealed class LifecycleResponse
 {
+    /// <summary>本地终态生效不代表外部同步完成；pending/watching/not-required/superseded/waiting-for-send/not-tracked。</summary>
+    public string ExternalState { get; init; } = "pending";
     public string OperationId { get; init; } = string.Empty;
     public string RequestId { get; init; } = string.Empty;
     public string SubscriberId { get; init; } = string.Empty;
@@ -77,6 +79,9 @@ public sealed class LifecycleResponse
 
 public sealed class LifecycleOperationResponse
 {
+    public string ExternalState { get; init; } = "pending";
+    public DateTime? LastExternalConfirmedAt { get; init; }
+    public string? ExternalError { get; init; }
     public string OperationId { get; init; } = string.Empty;
     public string RequestId { get; init; } = string.Empty;
     public string SubscriberId { get; init; } = string.Empty;

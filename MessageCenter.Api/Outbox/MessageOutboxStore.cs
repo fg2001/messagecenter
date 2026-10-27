@@ -112,6 +112,8 @@ public sealed class MessageOutboxStore
             if (deferredMarkers.Count > 0)
             {
                 MessageLifecycleStore.ApplyDeferredMarkers(deferredMarkers, entities, now);
+                foreach (var row in entities.Where(x => MessageBusinessState.IsTerminal(x.BusinessState)))
+                    MessageTerminalSyncStore.Schedule(_db, row, now, neverTriggered: true);
                 await _db.SaveChangesAsync(ct);
             }
 
