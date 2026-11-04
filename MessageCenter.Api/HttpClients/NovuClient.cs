@@ -44,7 +44,13 @@ public class NovuClient
             JsonOptions,
             ct);
 
-        return envelope?.Data ?? throw new InvalidOperationException("Empty trigger response from Novu.");
+        var result = envelope?.Data ?? throw new InvalidOperationException("Empty trigger response from Novu.");
+        if (!string.Equals(result.TransactionId, transactionId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Novu trigger transaction mismatch.");
+        }
+
+        return result;
     }
 
     public async Task<FeedResult> GetFeedAsync(

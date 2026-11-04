@@ -16,10 +16,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.Configure<NovuOptions>(
     builder.Configuration.GetSection(NovuOptions.Section));
-builder.Services.Configure<SourceSystemOptions>(options =>
-{
-    builder.Configuration.GetSection(SourceSystemOptions.Section).Bind(options.Names);
-});
+builder.Services.Configure<SourceSystemOptions>(options => options.Bind(builder.Configuration));
 builder.Services.Configure<RedisOptions>(
     builder.Configuration.GetSection(RedisOptions.Section));
 var messageCenterConnectionString =

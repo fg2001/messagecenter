@@ -57,6 +57,55 @@ Authorization: Bearer <token>
 
 ## API 契约
 
+### 受保护来源的服务身份
+
+原有`SourceSystemNames`登记保持。需要限制为专用服务Token的来源可增加：
+
+```json
+{
+  "SourceServiceIdentities": {
+    "micip": {
+      "Issuer": "<实际issuer>",
+      "Subject": "<实际服务账号sub>",
+      "ClientId": "<实际服务客户端azp>",
+      "Audience": "<MC API受众>"
+    }
+  }
+}
+```
+
+以上是占位示例，不能直接上线。字典键是`SourceSystemNames`的来源值，不是服务用户名或正文自报值。对应环境变量如`SourceServiceIdentities__micip__Subject`。启用前核对实际已验证服务Token的四项声明；不从客户端名推导sub，不输出完整Token或凭据。
+
+发送、发送查询与重试共用来源准入：在现有JWT签名/issuer/有效期认证后，受保护来源要求精确匹配issuer/sub/azp，aud必须包含配置的MC受众。缺失/重复身份声明、未认证人员或不完整配置返回403/`SOURCE_SERVICE_IDENTITY_DENIED`，不访问业务存储或Novu。不采用用户名相同、`client_id`或人员会话作为回退。仅身份配置不能代替来源登记，正文不能改变来源。
+
+显式声明来源节点为`{}`、`null`或空字符串同样视为已启用保护但配置不完整，三个来源入口均拒绝访问；不会因.NET 6字典绑定忽略空项而恢复用户名放行。只有最终合并配置中没有该来源节点时，才视为未配置保护。
+
+未配置保护的其他来源保留原行为；这不是全局JWT受众加固，个人消息接口及未配置来源仍有原认证边界。既有客户端需要逐个盘点后迁移，不能据此宣称所有调用已经安全。HTTP测试issuer可精确配置，不改变现有HTTPS元数据设置；生产传输要求另行验收。
+
+配置错误或凭据/客户端变化后的403不证明原消息未发送；保留requestId与UNKNOWN，修正绑定后查询原键。配置不会创建用户、会话、订阅者、工作流或角色，不同步人员/组织。不新增表或依赖。
+
+回退不得直接删除已生效的身份保护并恢复仅用户名放行。应暂停该来源新发送，必要时撤销其来源登记来封闭所有服务入口，再使用仍具身份约束的兼容代码/配置恢复原键查询；保留Outbox和历史消息。不得通过改名、借用其他来源或换requestId绕过拒绝。真实身份/共享实例兼容、API管道和渠道送达仍需部署验收。
+
+
+
+### 按来源选择工作流
+
+默认继续使用`Novu:DefaultWorkflowId`。需要独立渠道的已登记来源可设置：
+
+```json
+{
+  "Novu": {
+    "SourceWorkflows": { "micip": "micip-reminder" }
+  }
+}
+```
+
+环境变量对应`Novu__SourceWorkflows__micip=micip-reminder`。键是MC服务端`SourceSystemNames`映射的来源值，不是客户端自报的`sourceSystem`或服务用户名。发送鉴权和来源登记保持，正文不能选择工作流；未配置的来源继续使用原默认工作流。显式配置空值返回503/`SOURCE_WORKFLOW_UNAVAILABLE`，不会降回共享工作流。
+
+工作流须在Novu预先配置并验证渠道及测试接收人；此配置不创建工作流，也不保证主动提醒额度、截止时间或最终送达。API与Worker无需新增表或请求字段，Worker继续使用Outbox已保存的工作流。配置调整仅影响新受理请求；同键同载荷重放返回原结果，重试使用原行的工作流，不会改投新工作流。配置切换前须排查未确定请求并保留原键，不能换键规避不确定状态。
+
+回退时先暂停受影响来源的新发送，保留已入账任务和原工作流；撤销本项配置不会撤回已发送消息或重写Outbox。共享默认工作流及其他来源配置无需修改。
+
 ### 发送消息
 
 `POST /api/message-center/send`
@@ -263,3 +312,8 @@ dotnet restore .\MessageCenter.Worker\MessageCenter.Worker.csproj -r linux-x64
 dotnet publish .\MessageCenter.Worker\MessageCenter.Worker.csproj `
   -c Release -r linux-x64 --self-contained true --no-restore
 ```
+## Novu 触发回执与原键
+
+触发客户端要求成功 HTTP 响应中的 `data.transactionId` 与本次发送的 `sendId` 精确一致（区分大小写，不裁剪空白）。缺失、空值或不匹配均抛出固定错误 `Novu trigger transaction mismatch.`，不把其他事务的回执写成本事务 accepted。Worker 继续使用既有失败路径、原 Outbox 行、工作流、载荷和原键；不新建请求、不返还 MICIP 额度。错误日志不包含对端返回的错误事务 ID。
+
+此检查只证明回执关联，不证明送达、已读或业务处理，也不能证明异常响应对应的原请求从未受理。现有 MC 自动原键重试仍依赖 Novu 幂等保留窗口；配置和实际版本须单独核验，窗口过期、截止执行、跨日和 UNKNOWN 结算不由本补丁保证。`AcceptedAt` 是本地收到成功回执的观察时间，不能代替真实平台受理日；MC 202 和查询404均不作最终送达/未发送证明。无请求字段、表、依赖或部署配置变更。

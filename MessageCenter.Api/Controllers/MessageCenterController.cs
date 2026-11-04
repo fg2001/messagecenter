@@ -46,23 +46,20 @@ public sealed class MessageCenterController : ControllerBase
         [FromBody] SendMessageRequest request,
         CancellationToken ct)
     {
-        var clientId = GetPreferredUsername();
-        if (clientId is null)
-        {
-            return Unauthorized(new { error = "preferred_username claim is missing from token." });
-        }
-
-        if (!_sourceSystemOptions.Names.TryGetValue(clientId, out var sourceSystem))
-        {
-            return StatusCode(StatusCodes.Status403Forbidden, new
-            {
-                error = $"Client '{clientId}' is not registered in SourceSystemNames.",
-                clientId
-            });
-        }
+        var source = GetSourceSystem();
+        if (source.Result is not null) return source.Result;
+        var sourceSystem = source.Name!;
 
         request.SourceSystem = sourceSystem;
-        var triggers = MessageMapper.Map(request, _options.DefaultWorkflowId, out var skipped);
+        if (!_options.TryGetWorkflow(sourceSystem, out var workflowId))
+        {
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+            {
+                code = "SOURCE_WORKFLOW_UNAVAILABLE",
+                error = "The registered source workflow is not configured."
+            });
+        }
+        var triggers = MessageMapper.Map(request, workflowId, out var skipped);
         if (triggers.Count == 0)
         {
             return BadRequest(new
@@ -260,6 +257,15 @@ public sealed class MessageCenterController : ControllerBase
             {
                 error = $"Client '{clientId}' is not registered in SourceSystemNames.",
                 clientId
+            }));
+        }
+
+        if (!_sourceSystemOptions.AllowsService(sourceSystem, User))
+        {
+            return (null, StatusCode(StatusCodes.Status403Forbidden, new
+            {
+                code = "SOURCE_SERVICE_IDENTITY_DENIED",
+                error = "The token is not authorized for this source."
             }));
         }
 
