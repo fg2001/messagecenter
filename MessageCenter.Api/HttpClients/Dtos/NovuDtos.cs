@@ -27,6 +27,7 @@ public class NovuMessagePayload
     public string? SourceSystem { get; set; }
     public string? BusinessType { get; set; }
     public string? BusinessId { get; set; }
+    public string? Url { get; set; }
 }
 
 public class NovuCta

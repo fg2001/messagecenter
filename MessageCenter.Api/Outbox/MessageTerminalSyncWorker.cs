@@ -69,6 +69,15 @@ public sealed class MessageTerminalSyncWorker : BackgroundService
                 : JsonSerializer.Deserialize<string[]>(item.MessageIds) ?? throw new InvalidOperationException("TERMINAL_TARGETS_INVALID"))
                 .Concat(result.MessageIds).Distinct(StringComparer.Ordinal).ToList();
             if (!await store.RecordTargetsAsync(item, JsonSerializer.Serialize(ids), result.NextPage, ct)) return;
+            // A bounded scan may span several claims. Deleting now would shift later pages
+            // and could falsely confirm convergence while a matching message was skipped.
+            if (!result.Exhausted)
+            {
+                await store.FinishAsync(item, "pending",
+                    DateTime.UtcNow.AddSeconds(_options.OutboxVisibilityRetrySeconds),
+                    "TERMINAL_FEED_SCAN_INCOMPLETE", false, ct);
+                return;
+            }
             var projection = services.GetRequiredService<MessageProjectionStore>();
             foreach (var id in ids)
             {

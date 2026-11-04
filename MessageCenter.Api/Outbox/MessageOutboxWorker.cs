@@ -280,7 +280,8 @@ public sealed class MessageOutboxWorker : BackgroundService
         {
             var feed = await novu.GetFeedAsync(page, FeedPageSize, item.SubscriberId, ct);
             var message = feed.Data.FirstOrDefault(x =>
-                string.Equals(x.TransactionId, item.NovuTransactionId, StringComparison.Ordinal) ||
+                (!string.IsNullOrWhiteSpace(item.NovuTransactionId) &&
+                 string.Equals(x.TransactionId, item.NovuTransactionId, StringComparison.Ordinal)) ||
                 string.Equals(x.TransactionId, item.SendId, StringComparison.Ordinal) ||
                 string.Equals(x.Payload?.SendId, item.SendId, StringComparison.Ordinal));
             if (message is not null) return message;

@@ -9,6 +9,8 @@ namespace MessageCenter.Api.Services;
 
 public sealed class MessageProjectionStore
 {
+    // URL mapping changed: cached CTA values must be rebuilt from the original payload.
+    private const string ProjectionVersion = "p10:";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     private readonly IDatabase _redis;
@@ -53,7 +55,7 @@ public sealed class MessageProjectionStore
     {
         var revision = await RevisionAsync(subscriberId);
         var stamp = await _redis.StringGetAsync(ReadyKey(subscriberId));
-        return stamp.HasValue && stamp.ToString().StartsWith("p9:" + revision + ":", StringComparison.Ordinal)
+        return stamp.HasValue && stamp.ToString().StartsWith(ProjectionVersion + revision + ":", StringComparison.Ordinal)
             ? stamp.ToString() : null;
     }
 
@@ -116,7 +118,7 @@ public sealed class MessageProjectionStore
                 ReadyKey(subscriberId),
                 RebuildRevisionKey(subscriberId, generation)
             },
-            new RedisValue[] { generation, "p9:" + revision + ":" + generation });
+            new RedisValue[] { generation, ProjectionVersion + revision + ":" + generation });
         if ((long)result == 0)
         {
             throw new InvalidOperationException(
@@ -373,7 +375,9 @@ public sealed class MessageProjectionStore
             BusinessId = message.Payload?.BusinessId,
             Title = message.Subject,
             Content = message.Content,
-            Url = message.Cta?.Data?.Url,
+            // CTA templates may HTML-escape URL delimiters. The sender's URL is canonical;
+            // retain the CTA fallback for legacy messages without payload.url.
+            Url = message.Payload?.Url ?? message.Cta?.Data?.Url,
             Read = message.Read,
             Seen = message.Seen,
             CreatedAt = message.CreatedAt

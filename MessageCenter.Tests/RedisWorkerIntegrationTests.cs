@@ -4,6 +4,7 @@ using MessageCenter.Api.Services;
 using MessageCenter.Api.Data;
 using MessageCenter.Api.Outbox;
 using System.Reflection;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
@@ -126,6 +127,67 @@ public sealed class RedisWorkerIntegrationTests : IAsyncLifetime
         await store.BeginRebuildAsync(person, "p9");
         await store.CompleteRebuildAsync(person, "p9");
         Assert.Equal(0, (await store.GetSummaryAsync(person))!.TotalCount);
+    }
+
+    [Theory]
+    [InlineData("https://example.invalid/todos/open?ref=tdl_a&mode=a%3Db", "https://example.invalid/todos/open?ref&#x3D;tdl_a&amp;mode&#x3D;a%3Db", "https://example.invalid/todos/open?ref=tdl_a&mode=a%3Db")]
+    [InlineData("https://example.invalid/todos/open?ref=tdl_a&literal=%26%23x3D%3B#section", "https://example.invalid/other", "https://example.invalid/todos/open?ref=tdl_a&literal=%26%23x3D%3B#section")]
+    [InlineData("https://example.invalid/todos/open?literal=&#x3D;", "https://example.invalid/other", "https://example.invalid/todos/open?literal=&#x3D;")]
+    [InlineData("", "https://example.invalid/legacy", "")]
+    [InlineData(null, "https://example.invalid/legacy?ref=tdl_a", "https://example.invalid/legacy?ref=tdl_a")]
+    [InlineData(null, null, null)]
+    public async Task Projection_preserves_payload_url_without_html_decoding_or_url_reencoding(
+        string? payloadUrl, string? ctaUrl, string? expected)
+    {
+        const string person = "url-person";
+        const string body = "Keep content &amp; markup unchanged.";
+        var message = JsonSerializer.Deserialize<NovuMessageItem>(JsonSerializer.Serialize(new
+        {
+            id = "url-message", content = body, read = true,
+            payload = new { url = payloadUrl },
+            cta = new { data = new { url = ctaUrl } }
+        }), new JsonSerializerOptions(JsonSerializerDefaults.Web))!;
+        var store = CreateStore();
+        await store.BeginRebuildAsync(person, "url-generation");
+        await store.UpsertRebuildAsync(person, "url-generation", new[] { message });
+        await store.CompleteRebuildAsync(person, "url-generation");
+
+        var page = await store.GetPageAsync(person, "read", 1, 10);
+        var item = Assert.Single(page!.Items);
+        Assert.Equal(expected, item.Url);
+        Assert.Equal(body, item.Content);
+        Assert.True(item.Read);
+        Assert.Equal(1, page.TotalCount);
+        Assert.Equal(0, page.UnreadCount);
+    }
+
+    [Fact]
+    public async Task Old_cta_projection_requires_rebuild_and_publishes_original_url()
+    {
+        const string person = "old-cta-person";
+        const string originalUrl = "https://example.invalid/todos/open?ref=tdl_original";
+        var database = _redis.GetDatabase(_options.Database);
+        var readyKey = $"{_options.KeyPrefix}:{{{person}}}:ready";
+        await database.StringSetAsync(readyKey, "p9:0:old-cta-generation");
+        var store = CreateStore();
+        Assert.False(await store.IsReadyAsync(person));
+        Assert.Null(await store.GetPageAsync(person, "all", 1, 10));
+        Assert.Null(await store.GetSummaryAsync(person));
+        Assert.Empty(await store.GetUnreadIdsAsync(person, 10));
+
+        var message = Message("original-url-message", false);
+        message.Payload = new() { Url = originalUrl };
+        message.Cta = new() { Data = new() { Url = "https://example.invalid/todos/open?ref&#x3D;tdl_original" } };
+        await store.BeginRebuildAsync(person, "original-url-generation");
+        await store.UpsertRebuildAsync(person, "original-url-generation", new[] { message });
+        await store.CompleteRebuildAsync(person, "original-url-generation");
+
+        Assert.True(await store.IsReadyAsync(person));
+        var page = await store.GetPageAsync(person, "all", 1, 10);
+        Assert.Equal(originalUrl, Assert.Single(page!.Items).Url);
+        Assert.Equal(1, page.TotalCount);
+        Assert.Equal(1, page.UnreadCount);
+        Assert.StartsWith("p10:0:", (await database.StringGetAsync(readyKey)).ToString());
     }
 
     [Theory]
